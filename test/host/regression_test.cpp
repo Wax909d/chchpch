@@ -98,8 +98,8 @@ int main() {
     turbo.forceSpeed(7, millis());                     // 8x, no handshake
     run(300);
     check(turbo.locked() && turbo.baud() == 250000, "turbo: forced 8x locks under the new TX path");
-    turbo.forceSpeed(1, millis());                     // back to 1x: All Notes Off
-    run(300);
+    turbo.forceSpeed(1, millis());                     // back to 1x: All Notes Off,
+    run(300 + TURBO_REVERT_HOLD_MS);                   //   after the revert hold
     check(!turbo.negotiating() && turbo.baud() == 31250, "turbo: back to 31250");
     bool live = false, stale = false;
     for (const Msg& m : messagesSince(mark)) {

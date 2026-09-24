@@ -5,7 +5,8 @@ Teensy 4.0 firmware for the XY6, a controller for the Elektron Monomachine:
 - six Monomachine-style LFOs, phase-locked to the machine's MIDI clock
 - a melodic pattern generator with scenes, p-locks and ratchets
 - a MIDI joystick that drives any mix of the six tracks
-- TurboMIDI, a 256×64 OLED UI, and presets on a 24LC512 EEPROM
+- TurboMIDI at 8x over the standard DIN cable (type `turbo` on the console, or SET → TURBO → ENGAGE)
+- a 256×64 OLED UI, and presets on a 24LC512 EEPROM
 
 Everything is in one sketch, [`XY6_LFO/XY6_LFO.ino`](XY6_LFO/XY6_LFO.ino). Its header
 has the wiring, the controls, and a "WHAT CHANGED" entry for every version.
@@ -31,6 +32,7 @@ This builds the sketch on a PC with g++ against a small model of the Teensy API
 | `midi_latency_test` | how late notes and stick CCs reach the MIDI wire under a full stage load (pattern, six LFOs, stick on six tracks) |
 | `joystick_filter_test` | stick step response, and that a resting or held stick sends nothing through ADC noise and spikes |
 | `regression_test` | one check for each bug fixed in v1.18 |
+| `turbo_test <scenario>` | the TurboMIDI handshake against a model of the Elektron machine: the full exchange byte for byte, the keepalive, and six ways it can fail (no caps, no ACK, bad echo, machine power-cycled mid-link, `turbo off`, silent machine) |
 
 CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs these and a
 real Teensy 4.0 compile on every push.

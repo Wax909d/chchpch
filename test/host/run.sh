@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 out="${TMPDIR:-/tmp}/xy6-host-tests"
 mkdir -p "$out"
 flags=(-std=gnu++17 -O2 -Wall -Wextra -Werror -Imock)
-for t in midi_latency_test joystick_filter_test regression_test; do
+for t in midi_latency_test joystick_filter_test regression_test turbo_test; do
   g++ "${flags[@]}" "$t.cpp" -o "$out/$t"
 done
 status=0
@@ -16,4 +16,7 @@ echo "== MIDI OUT latency, typical load"; "$out/midi_latency_test" typical || st
 echo; echo "== MIDI OUT latency, heavy load"; "$out/midi_latency_test" heavy || status=1
 echo; echo "== joystick smoothing"; "$out/joystick_filter_test" || status=1
 echo; echo "== v1.18 regressions"; "$out/regression_test" || status=1
+for s in happy nocaps noack badecho drop off silent; do
+  echo; echo "== TurboMIDI: $s"; "$out/turbo_test" "$s" || status=1
+done
 exit $status

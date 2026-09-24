@@ -8,6 +8,9 @@
 //     size and availableForWrite() arithmetic, draining onto the wire at
 //     baud / 10 bytes a second - because MIDI output latency is what the
 //     host test measures;
+//   * the LPUART's transmit-complete flag is modelled too (IMXRT_LPUART6.STAT
+//     TC), so the sketch's own Teensy 4 code path decides when the UART is
+//     idle, and a baud change with a byte still going out is counted;
 //   * I2C always ACKs, reads back 0xFF, and analogRead() returns whatever the
 //     test puts in sim::adc[].
 #pragma once
@@ -26,11 +29,16 @@ namespace sim {
 inline uint64_t nowNs = 0;                // the one clock; micros() reads it
 inline uint64_t nowUs() { return nowNs / 1000u; }
 inline uint16_t adc[64] = {0};
-// Every byte Serial1 was handed: value, when it was written into the ring, and
-// when its stop bit left the pin.
-struct WireByte { uint8_t b; uint64_t writeUs, doneUs; };
+// Every byte Serial1 was handed: value, when it was written into the ring,
+// when its stop bit left the pin, and the baud it went out at.
+struct WireByte { uint8_t b; uint64_t writeUs, doneUs; uint32_t baud; };
 inline std::vector<WireByte> wire;
 inline uint32_t txOverruns = 0;   // write() into a full ring (would block on HW)
+// begin() called while a byte was still being shifted out - on the board that
+// byte is cut off mid-frame.
+inline uint32_t txTruncations = 0;
+struct BaudChange { uint64_t us; uint32_t baud; };
+inline std::vector<BaudChange> baudChanges;   // every Serial1.begin()
 }
 
 // Rough costs, so busy code takes time: a micros() call 1 us (pessimistic),
@@ -144,7 +152,14 @@ inline CrashReportClass CrashReport;
 class HardwareSerial : public Print {
  public:
   explicit HardwareSerial(bool modelTx) : modelTx_(modelTx) {}
-  void begin(uint32_t baud) { baud_ = baud; drain(); pend_.clear(); rx_.clear(); }
+  void begin(uint32_t baud) {
+    drain();
+    if (modelTx_) {
+      if (!pend_.empty()) sim::txTruncations++;
+      sim::baudChanges.push_back({sim::nowUs(), baud});
+    }
+    baud_ = baud; pend_.clear(); rx_.clear();
+  }
   void addMemoryForRead(void*, size_t) {}
   void addMemoryForWrite(void*, size_t n) { txSize_ = 64 + (int)n; }
   int available() { return (int)rx_.size(); }
@@ -163,11 +178,14 @@ class HardwareSerial : public Print {
     const uint64_t now = sim::nowUs();
     const uint64_t start = pend_.empty() ? now : std::max(now, pend_.back());
     pend_.push_back(start + byteUs);
-    sim::wire.push_back({b, now, start + byteUs});
+    sim::wire.push_back({b, now, start + byteUs, baud_});
     return 1;
   }
   void inject(uint8_t b) { rx_.push_back(b); }
   int txSize() const { return txSize_; }
+  uint32_t baud() const { return baud_; }
+  // FIFO and shift register both empty: the LPUART's TC flag.
+  bool txComplete() { drain(); return pend_.empty(); }
  private:
   static const int kHwDepth = 5;                  // 4-deep FIFO + shift register
   void drain() { while (!pend_.empty() && pend_.front() <= sim::nowUs()) pend_.pop_front(); }
@@ -179,3 +197,23 @@ class HardwareSerial : public Print {
 };
 inline HardwareSerial Serial1(true);
 inline HardwareSerial Serial2(false);
+
+// ---- LPUART6, the register block behind Serial1 -------------------------------
+// Only what the sketch's tmTxIdle() / tmPortRestart() touch. Defining the
+// chip's macro puts the sketch on its real Teensy 4 code path.
+#define __IMXRT1062__ 1
+#define LPUART_STAT_TC      (1u << 22)
+#define LPUART_STAT_OR      (1u << 19)
+#define LPUART_STAT_NF      (1u << 18)
+#define LPUART_STAT_FE      (1u << 17)
+#define LPUART_STAT_PF      (1u << 16)
+#define LPUART_FIFO_TXFLUSH (1u << 15)
+#define LPUART_FIFO_RXFLUSH (1u << 14)
+struct MockLpuart {
+  struct Stat {
+    operator uint32_t() const { return Serial1.txComplete() ? LPUART_STAT_TC : 0u; }
+    Stat& operator=(uint32_t) { return *this; }     // write-1-to-clear flags: no-op
+  } STAT;
+  uint32_t FIFO = 0;
+};
+inline MockLpuart IMXRT_LPUART6;
