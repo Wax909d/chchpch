@@ -22,6 +22,7 @@
 #include <math.h>
 #include <algorithm>
 #include <deque>
+#include <string>
 #include <vector>
 
 // ---- simulated time ---------------------------------------------------------
@@ -137,8 +138,13 @@ class usb_serial_class : public Print {
   int availableForWrite() { return 4096; }
   void flush() {}
   using Print::write;
-  size_t write(uint8_t b) override { if (echo) fputc(b, stdout); return 1; }
+  size_t write(uint8_t b) override {
+    if (echo) fputc(b, stdout);
+    if (captured.size() < (1u << 20)) captured.push_back((char)b);
+    return 1;
+  }
   bool echo = false;
+  std::string captured;           // everything the sketch printed, for tests
 };
 inline usb_serial_class Serial;
 

@@ -3,6 +3,25 @@
 // =============================================================================
 //
 // -----------------------------------------------------------------------------
+// WHAT CHANGED IN v1.20 - TURBOMIDI RESPONDER, TEST RETRIES, A REASON FOR FAILURE
+// -----------------------------------------------------------------------------
+// From v1.19 on a real Monomachine: it sends 10 by itself every few seconds
+// (TURBO enabled, looking for a TM-1), and our own handshake got 11 and 13
+// back, switched to 10x, sent the test - and heard nothing.
+//  * RESPONDER: the XY6 now answers the machine's own handshake, as a TM-1
+//    does - 11, 13, switch to its SPEED1, echo its test, 17, switch to its
+//    SPEED2. On from boot; 'turbo off' stops answering until 'turbo'.
+//  * The switch after our 13 or 17 is taken from pumpMidi() as well as
+//    loop(), so it lands within ~0.2 ms of the UART draining even mid-frame -
+//    the machine starts at the new speed behind only a 0.5 ms pad.
+//  * INITIATOR: no echo within 60 ms, the test goes again, pad and all, up to
+//    4 times inside the 250 ms step.
+//  * A step at 10x or 8x that times out now says what arrived since the
+//    switch: nothing, bytes that do not parse (speed mismatch, or a MIDI IN
+//    optocoupler too slow for TurboMIDI), or clock that parses (the link
+//    works; the machine did not answer). The raw first bytes are printed.
+//
+// -----------------------------------------------------------------------------
 // WHAT CHANGED IN v1.19 - TURBOMIDI INITIATOR, REBUILT TO THE CAPTURED PROTOCOL
 // -----------------------------------------------------------------------------
 //  * The negotiator is rebuilt around the handshake as captured from Elektron
@@ -920,6 +939,12 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define TURBO_SPEED2_CODE         7   //  8x
 // Longest wait for any one reply, and for the UART to drain before a switch.
 #define TURBO_STEP_TIMEOUT_MS   250
+// v1.20: no echo to the first speed test within this long, send the test again
+// (pad and all) - up to this many tests inside TURBO_STEP_TIMEOUT_MS. A
+// machine that is slower to change speed than the 16-byte pad allows misses
+// the first one.
+#define TURBO_TEST_RETRY_MS      60
+#define TURBO_TEST_TRIES          4
 // After the final switch to SPEED2, this long with nothing transmitted before
 // ordinary MIDI may go out.
 #define TURBO_SETTLE_US       10000
@@ -947,7 +972,7 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define PERF_FULL_FADERS   1
 
 // Shown on the boot screen and by the console. One place, so it cannot drift.
-#define XY6_VERSION              "1.19"
+#define XY6_VERSION              "1.20"
 
 // ---- Joystick (A0 / A1) -----------------------------------------------------
 // v1.17: the stick sends X and Y to every track picked on the JOY page (PERF
@@ -5014,10 +5039,21 @@ static void scenePrintSheet() {
 // different speed) or if a machine that WAS sending its own keepalive goes
 // silent for TURBO_PEER_SILENT_MS.
 //
-// INITIATOR ONLY. A handshake the machine starts from its own TURBO menu is
-// logged and not answered: following it needs the responder half of this
-// protocol, which is a different state machine and is not built. v1.18's
-// responder switched to the wrong speed without the two tests.
+// v1.20: AND THE RESPONDER. A Monomachine with TURBO enabled sends 10 on its
+// own, every few seconds, looking for a TM-1 - so the XY6 answers too, the
+// same exchange with the roles swapped:
+//
+//        R_WAIT_SET   <- 10        -> 11 7F 01 0F 00                    31250
+//        R_ACK        <- 12 s1 s2  -> 13, UART to s1 once it has left     31250
+//        R_WAIT_TEST  <- 00 x16, 14 pattern   -> 15 the same pattern    s1
+//        R_WAIT_TEST2 <- 16        -> 17, then FINALIZE / SETTLE / LOCKED
+//                                     at s2, as above                   s2
+//
+// The machine picks the speeds. Answering is on from boot; 'turbo off' stops
+// it until 'turbo'. If both ends start at once, the machine leads. A step at
+// the new speed that gets no reply is reported with what DID arrive since the
+// switch (see reportLine) - which tells a silent machine, a speed mismatch or
+// a too-slow MIDI IN optocoupler apart.
 
 static const uint32_t kTmSpeeds[12] = {31250,  31250,  62500,  104062, 125000,
                                        156250, 208125, 250000, 312500, 415625,
@@ -5041,15 +5077,18 @@ static const uint8_t TM_CMD_SPEED_RES2   = 0x17;   // <- result; both go to SPEE
 
 // 0x55 is alternating bits, the pattern a UART misframes first at a wrong baud.
 static const uint8_t kTmTestPattern[8] = {0x55, 0x55, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00};
-// What this machine answered in the captured exchange. Used for the log only:
-// the check is that SPEED1 and SPEED2 are on offer, not that the bytes match.
-static const uint8_t kTmCapsSeen[4] = {0x7F, 0x01, 0x0F, 0x00};
+// The capability answer, as a Monomachine gives it: 1x..10x on offer. The
+// initiator compares the machine's answer with it (for the log only - the
+// check is that SPEED1 and SPEED2 are offered); the responder answers with it.
+static const uint8_t kTmCaps[4] = {0x7F, 0x01, 0x0F, 0x00};
 
 class TurboMidi {
  public:
   enum St : uint8_t { OFF, REQUEST, WAIT_CAPS, NEGOTIATE, WAIT_ACK, SWITCH1,
                       FIRST_TEST, WAIT_ECHO, SECOND_TEST, WAIT_RESULT,
-                      FINALIZE, SETTLE, LOCKED, REVERT };
+                      FINALIZE, SETTLE, LOCKED, REVERT,
+                      // v1.20: the responder - the machine leads, we answer
+                      R_WAIT_SET, R_ACK, R_WAIT_TEST, R_WAIT_TEST2 };
 
   // txMax is Serial1.availableForWrite() on an idle port - how the negotiator
   // recognises that the software ring has gone empty.
@@ -5060,10 +5099,16 @@ class TurboMidi {
   const char* speedName() const { return kTmNames[cur_ < 12 ? cur_ : 0]; }
   bool     locked()    const { return st_ == LOCKED; }
   bool     negotiating() const { return st_ != OFF && st_ != LOCKED; }
-  // Steps 4..11 and REVERT: only the negotiator's own bytes may move.
+  // Steps 4..11, REVERT, and the responder from its ACK on: only the
+  // negotiator's own bytes may move.
   bool     holdsWire() const {
-    return (st_ >= NEGOTIATE && st_ <= SETTLE) || st_ == REVERT;
+    return (st_ >= NEGOTIATE && st_ <= SETTLE) || st_ == REVERT ||
+           st_ == R_ACK || st_ == R_WAIT_TEST || st_ == R_WAIT_TEST2;
   }
+  // Whether a handshake the machine starts is answered. On from boot, so a
+  // machine with TURBO enabled brings the link up by itself, as with a TM-1;
+  // 'turbo off' clears it, 'turbo' sets it again.
+  bool     answersMachine() const { return allow_; }
   const char* stateName() const {
     switch (st_) {
       case REQUEST:     return "REQUEST";
@@ -5079,6 +5124,10 @@ class TurboMidi {
       case SETTLE:      return "SETTLE";
       case LOCKED:      return "LOCKED";
       case REVERT:      return "REVERT";
+      case R_WAIT_SET:  return "R WAIT SET";
+      case R_ACK:       return "R ACK";
+      case R_WAIT_TEST: return "R WAIT TEST";
+      case R_WAIT_TEST2:return "R WAIT TEST2";
       default:          return "OFF";
     }
   }
@@ -5098,7 +5147,12 @@ class TurboMidi {
   // ---- what the receive path tells us ---------------------------------------
   // Every byte that arrives, valid or not. The LOCKED watchdog needs to tell
   // "the line is idle" apart from "the line is carrying nonsense".
-  void noteAnyByte() { if (anyRx_ < 0xFFFF) anyRx_++; }
+  // v1.20: the first bytes after each switch are kept, raw, for the report
+  // when a step at the new speed times out.
+  void noteAnyByte(uint8_t b) {
+    if (anyRx_ < 0xFFFF) anyRx_++;
+    if (rawN_ < sizeof raw_) raw_[rawN_++] = b;
+  }
   // Bytes whose exact value we can name. At the wrong baud a stream of
   // misframed noise produces status-looking bytes all day, so only these count.
   // FE from the machine also tells us it keeps the link alive itself - after
@@ -5118,6 +5172,7 @@ class TurboMidi {
   // ---- what the UI and the console ask for ----------------------------------
   // Start the handshake: 'turbo', or SET > TURBO > ENGAGE.
   void start(uint32_t nowMs) {
+    allow_ = true; refusedLogged_ = false;
     if (st_ == LOCKED) { tmSerial.printf("turbo: already at %s\n", speedName()); return; }
     if (negotiating()) { tmSerial.println(F("turbo: busy, try again in a moment")); return; }
     if (sweeping_)     { tmSerial.println(F("turbo: sweep running - try again after it")); return; }
@@ -5128,7 +5183,9 @@ class TurboMidi {
   }
   // Back to 1x: 'turbo off', or ENGAGE with SPEED set to 1X.
   void stop(uint32_t nowMs) {
-    if (st_ == OFF) { tmSerial.println(F("turbo: already at 1X")); return; }
+    allow_ = false; refusedLogged_ = false;
+    if (st_ == OFF) { tmSerial.println(F("turbo: at 1X, and the machine's requests will"
+                                         " not be answered until 'turbo'")); return; }
     if (st_ == REVERT) return;
     fail("turbo off requested", nowMs);
   }
@@ -5197,12 +5254,39 @@ class TurboMidi {
         target_ = TURBO_SPEED2_CODE;
         enter(FINALIZE, nowMs);
         break;
-      case TM_CMD_SPEED_REQ: case TM_CMD_SPEED_SET:
-      case TM_CMD_SPEED_TEST: case TM_CMD_SPEED_TEST2:
-        tmSerial.println(F("turbo: the machine is starting a handshake itself. The XY6\n"
-                           "       only initiates: type 'turbo' or use SET > TURBO >\n"
-                           "       ENGAGE, with the machine's TURBO setting enabled."));
-        return;
+      // ---- the responder (v1.20): the machine leads, we answer -------------
+      // The same exchange as above with the roles swapped - what a TM-1 does.
+      case TM_CMD_SPEED_REQ:                                        // <- 10
+        if (!machineMayLead()) return;
+        if (!sendCmd(TM_CMD_SPEED_ANS, kTmCaps, sizeof kTmCaps)) return;
+        tmSerial.println(F(">> TURBO: the machine asks what we support - answered"));
+        enter(R_WAIT_SET, nowMs);
+        break;
+      case TM_CMD_SPEED_SET:                                        // <- 12 s1 s2
+        if (st_ != R_WAIT_SET && !machineMayLead()) return;
+        if (len < 2 || d[0] < 1 || d[0] > 11 || d[1] < 1 || d[1] > 11) {
+          tmSerial.println(F("turbo: the machine's 12 names a speed we do not know - ignored"));
+          if (st_ == R_WAIT_SET) fail(nullptr, nowMs);
+          return;
+        }
+        speed1_ = d[0]; target_ = d[1];
+        if (!sendCmd(TM_CMD_SPEED_ACK, nullptr, 0)) return;
+        tmSerial.printf(">> TURBO: the machine asks for %s (test) / %s (run) - acknowledged\n",
+                        kTmNames[speed1_], kTmNames[target_]);
+        enter(R_ACK, nowMs);          // switches once our 13 has left the UART
+        break;
+      case TM_CMD_SPEED_TEST:                                       // <- 14 pattern
+        if (st_ != R_WAIT_TEST) return;
+        // Echo exactly what arrived: the machine is the judge of whether it
+        // survived the new speed.
+        if (!sendCmd(TM_CMD_SPEED_RES, d, len > 16 ? 16 : len)) return;
+        enter(R_WAIT_TEST2, nowMs);
+        break;
+      case TM_CMD_SPEED_TEST2:                                      // <- 16
+        if (st_ != R_WAIT_TEST2) return;
+        if (!sendCmd(TM_CMD_SPEED_RES2, nullptr, 0)) return;
+        enter(FINALIZE, nowMs);       // to SPEED2 once our 17 has left the UART
+        break;
       default:
         return;
     }
@@ -5214,7 +5298,19 @@ class TurboMidi {
     serviceSweep(nowMs);
     advance(nowMs);
     switch (st_) {
-      case WAIT_CAPS: case WAIT_ACK: case WAIT_ECHO: case WAIT_RESULT:
+      case WAIT_ECHO:
+        // v1.20: a machine slower to switch than the 16-byte pad allows
+        // misses the test. Send it again - pad and all - while there is time.
+        if (!timedOut(nowMs) && tries_ < TURBO_TEST_TRIES &&
+            (uint32_t)(nowMs - testMs_) >= (uint32_t)TURBO_TEST_RETRY_MS) {
+          tmSerial.printf("turbo: no echo yet - test again (%u of %u)\n",
+                          (unsigned)(tries_ + 1), (unsigned)TURBO_TEST_TRIES);
+          sendTest(nowMs);
+          break;
+        }
+        // fall through
+      case WAIT_CAPS: case WAIT_ACK: case WAIT_RESULT:
+      case R_WAIT_SET: case R_WAIT_TEST: case R_WAIT_TEST2:
         if (timedOut(nowMs)) {
           tmSerial.printf("turbo: no reply in %u ms at %s (%s).\n",
                           (unsigned)TURBO_STEP_TIMEOUT_MS, stateName(), speedName());
@@ -5222,6 +5318,7 @@ class TurboMidi {
             tmSerial.println(F("       Is the machine's MIDI OUT wired to pin 0, set to\n"
                                "       OUT (not THRU), with TURBO enabled? 'turbo sweep'\n"
                                "       tries other device ids."));
+          if (cur_ != 1) reportLine();
           fail(nullptr, nowMs);
         }
         break;
@@ -5229,6 +5326,13 @@ class TurboMidi {
       default: break;
     }
   }
+
+  // v1.20: called from pumpMidi() - every loop pass, every 256 bytes of a
+  // display push, the EEPROM driver, usbWait - so a switch that is waiting on
+  // the UART to drain happens within ~0.2 ms of it draining even mid-frame.
+  // It has to: as responder, the machine starts talking at SPEED1 the moment
+  // our 13 has arrived, behind only its 16-byte (0.5 ms) pad.
+  void poll(uint32_t nowMs) { if (st_ != OFF && st_ != LOCKED) advance(nowMs); }
 
   // Counters for 'turbo ?' and 's'.
   uint32_t locks()    const { return locks_; }
@@ -5265,16 +5369,22 @@ class TurboMidi {
         // Sixteen raw 00s, not SysEx: a data byte with no running status is
         // discarded by the receiver, so these are pure time for its UART to
         // settle at the new divisor before the test pattern arrives.
-        static const uint8_t kPad[16] = {0};
-        if (!qTurbo.push(kPad, sizeof kPad)) { fail("TX queue full", nowMs); return true; }
-        logHex("TURBO TX (pad):", kPad, sizeof kPad);
+        // (The pad goes out with the test, in step 7 - see sendTest().)
         enter(FIRST_TEST, nowMs);
         return true;
       }
       case FIRST_TEST:                                              // step 7
-        if (!sendCmd(TM_CMD_SPEED_TEST, kTmTestPattern, sizeof kTmTestPattern))
-          { fail("TX queue full", nowMs); return true; }
+        tries_ = 0;
+        if (!sendTest(nowMs)) { fail("TX queue full", nowMs); return true; }
         enter(WAIT_ECHO, nowMs);
+        return true;
+      case R_ACK:                                   // responder: our 13 is out
+        if (!txIdle()) {
+          if (timedOut(nowMs)) { fail("TX never went idle after our ACK", nowMs); return true; }
+          return false;
+        }
+        switchTo(speed1_, nowMs);
+        enter(R_WAIT_TEST, nowMs);
         return true;
       case SECOND_TEST:                                             // step 9
         if (!sendCmd(TM_CMD_SPEED_TEST2, nullptr, 0)) { fail("TX queue full", nowMs); return true; }
@@ -5400,11 +5510,63 @@ class TurboMidi {
     sysex1.reset();
     midiRxReset();                      // running status / SPP from the old speed
     g_txInSysex = false;                // the ring was just emptied
-    anyRx_ = 0; rxSeen_ = 0;
+    anyRx_ = 0; rxSeen_ = 0; rawN_ = 0;
     lastRxMs_ = wdMs_ = nowMs;
     tmSerial.printf(">> TURBO: UART now %lu baud (%s)\n",
                     (unsigned long)kTmSpeeds[code], kTmNames[code]);
     uiTouch();
+  }
+
+  // Step 6's pad and step 7's test, in that order, into qTurbo. Sixteen raw
+  // 00s, not SysEx: a data byte with no running status is discarded by the
+  // receiver, so they are pure time for its UART to settle at the new divisor
+  // before the pattern arrives. Also the retry, pad and all.
+  bool sendTest(uint32_t nowMs) {
+    static const uint8_t kPad[16] = {0};
+    if (!qTurbo.push(kPad, sizeof kPad)) return false;
+    logHex("TURBO TX (pad):", kPad, sizeof kPad);
+    if (!sendCmd(TM_CMD_SPEED_TEST, kTmTestPattern, sizeof kTmTestPattern)) return false;
+    tries_++; testMs_ = nowMs;
+    return true;
+  }
+
+  // Can a handshake the machine starts be taken up now? Only at 1x with
+  // nothing under way - or while our own request is still waiting for its
+  // answer, in which case both ends started at once and the machine leads.
+  bool machineMayLead() {
+    if (!(st_ == OFF || st_ == WAIT_CAPS || st_ == R_WAIT_SET) || cur_ != 1 || sweeping_)
+      return false;
+    if (!allow_) {
+      if (!refusedLogged_)
+        tmSerial.println(F("turbo: the machine asks for TurboMIDI - not answering after\n"
+                           "       'turbo off'. Type 'turbo' to allow it again."));
+      refusedLogged_ = true;
+      return false;
+    }
+    return true;
+  }
+
+  // Why a step at the new speed got no reply. The machine's MIDI clock keeps
+  // arriving through a handshake, so what reached us since the switch tells
+  // three failures apart.
+  void reportLine() const {
+    char b[3 * sizeof raw_ + 1]; int k = 0;
+    for (uint8_t i = 0; i < rawN_; ++i) k += snprintf(b + k, sizeof b - (size_t)k, " %02X", raw_[i]);
+    b[k] = 0;
+    tmSerial.printf("       at %s since the switch: %u bytes in, %u of them parsed"
+                    " (clock, FE).%s%s\n", speedName(), (unsigned)anyRx_, (unsigned)rxSeen_,
+                    rawN_ ? " First bytes:" : "", b);
+    if (!anyRx_)
+      tmSerial.println(F("       NOTHING arrived: the machine sent nothing at this speed, or\n"
+                         "       the XY6's MIDI IN does not pass it at all."));
+    else if (!rxSeen_)
+      tmSerial.println(F("       Bytes arrive but none parse: the two ends are at different\n"
+                         "       speeds - or the MIDI IN optocoupler is too slow for this\n"
+                         "       speed (a 6N138 tops out near 2x; TurboMIDI needs a 6N137\n"
+                         "       or H11L1, as in Elektron's own gear and the TM-1)."));
+    else
+      tmSerial.println(F("       Clock parses at this speed, so the link itself works: the\n"
+                         "       machine did not answer. Its timing, not the wire."));
   }
 
   // Bit (code - 1) of the 14-bit mask in the first two data bytes is speed
@@ -5412,7 +5574,7 @@ class TurboMidi {
   bool capsOffer(uint8_t len, const uint8_t* d) const {
     if (len < 2) return false;
     const uint16_t mask = (uint16_t)((d[0] & 0x7F) | ((uint16_t)(d[1] & 0x7F) << 7));
-    const bool same = (len == sizeof kTmCapsSeen && memcmp(d, kTmCapsSeen, len) == 0);
+    const bool same = (len == sizeof kTmCaps && memcmp(d, kTmCaps, len) == 0);
     tmSerial.printf("turbo: machine offers mask %04X%s\n", (unsigned)mask,
                     same ? " (as captured)" : " - differs from the captured 7F 01 0F 00");
     return ((mask >> (TURBO_SPEED1_CODE - 1)) & 1u) && ((mask >> (TURBO_SPEED2_CODE - 1)) & 1u);
@@ -5497,6 +5659,12 @@ class TurboMidi {
   uint8_t  sweepId_ = 0;
   bool     sweeping_ = false;
   uint32_t locks_ = 0, reverts_ = 0;
+  uint8_t  speed1_ = TURBO_SPEED1_CODE;   // responder: what the machine asked for
+  uint8_t  tries_ = 0;                    // initiator: tests sent this attempt
+  uint32_t testMs_ = 0;
+  bool     allow_ = true, refusedLogged_ = false;
+  uint8_t  raw_[12];                      // first bytes after a switch
+  uint8_t  rawN_ = 0;
 };
 
 static TurboMidi turbo;
@@ -8778,7 +8946,7 @@ static void handleMidiByte(uint8_t b) {
   }
   // Feeds the turbo link watchdog. See TurboMidi::noteLiveByte for why this is
   // not simply "any status byte".
-  turbo.noteAnyByte();
+  turbo.noteAnyByte(b);
   if (b & 0x80) turboNoteLiveByte(b);
   // Realtime bytes may appear anywhere, including inside a SysEx, so they are
   // dispatched before the SysEx collector ever sees them.
@@ -8861,8 +9029,10 @@ static void handleMidiByte(uint8_t b) {
     const uint8_t r = sysex1.feed(b, millis());
     if (r == SysexRx::TURBO_MSG) {
       rxSysex++;
-      turbo.onMessage(sysex1.cmd(), sysex1.len(), sysex1.data(), millis());
+      // Liveness first: onMessage() may switch the baud, which restarts the
+      // count of what arrived at the new speed - this message came at the old.
       turbo.noteTurboSeen(millis());
+      turbo.onMessage(sysex1.cmd(), sysex1.len(), sysex1.data(), millis());
       return;
     }
     if (r == SysexRx::FOREIGN_MSG) {
@@ -8900,6 +9070,7 @@ static void handleMidiByte(uint8_t b) {
 // Drain both MIDI inputs. Called from the main loop and from inside flushAll(),
 // so a frame push can never let the RX buffer overrun.
 static void pumpMidi() {
+  turbo.poll(millis());       // v1.20: a switch waiting on the UART, taken now
   // Sampled before draining, so it is the true high-water mark of how far
   // behind the loop ever fell. At 10x this is the headroom number that matters.
   const int a = Serial1.available();
@@ -8989,8 +9160,9 @@ static void printHelp() {
     "  e              LFO 1 on/off\n"
     "  turbo          TurboMIDI: handshake tested at 10x, run at 8x, FE\n"
     "                 keepalive every 150 ms while it is up\n"
-    "  turbo off      back to 31250 baud   |   turbo ?   link state\n"
-    "  turbo v        toggle raw hex logging of turbo messages\n"
+    "  turbo off      back to 31250 baud, and stop answering the machine\n"
+    "  turbo ?        link state\n"
+    "  turbo v        toggle raw hex logging (ON at boot)\n"
     "  turbo sweep    walk the device-id byte 00..7F looking for ANY answer\n"
     "  turbo f <n>    FORCE 1, 8 or 10x with no handshake (diagnostic)\n"
     "                 NOTE: the machine's MIDI OUT must be wired back into\n"
@@ -9369,6 +9541,8 @@ static void handleCommand(const char* c) {
       Serial.printf("       SPEED1 code %u = %s (test)   SPEED2 code %u = %s (run)\n",
                     (unsigned)TURBO_SPEED1_CODE, kTmNames[TURBO_SPEED1_CODE],
                     (unsigned)TURBO_SPEED2_CODE, kTmNames[TURBO_SPEED2_CODE]);
+      Serial.printf("       answers the machine's own handshake: %s\n",
+                    turbo.answersMachine() ? "yes" : "no ('turbo' to allow)");
       Serial.printf("       keepalive %s, %lu FE sent; machine's own keepalive %s\n",
                     g_tmKeepalive ? "ON" : "off", (unsigned long)g_tmFeSent,
                     turbo.peerKeepalive() ? "seen" : "not seen");

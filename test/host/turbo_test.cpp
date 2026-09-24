@@ -12,6 +12,10 @@
 // MIDI clock. A byte that reaches either end while the two are at different
 // speeds is misframed: the peer counts it, and the XY6 receives junk.
 //
+// With `leads` set it is the machine as a real Monomachine with TURBO on
+// behaves: it sends 10 by itself every 2 s and drives the same exchange from
+// the other side, switching its own UART on the F7 of our 13 and 17.
+//
 //   ./turbo_test <scenario>     one of the kScenarios below; exit 0 = pass
 #ifndef SKETCH
 #define SKETCH "../../XY6_LFO/XY6_LFO.ino"
@@ -38,6 +42,10 @@ struct Peer {
   // How it behaves.
   bool answersCaps = true, acks = true, echoIntact = true, answersTest2 = true;
   bool ownKeepalive = true, clock = true;
+  bool leads = false;                  // it starts the handshake itself
+                                       //   (first probe at nextProbe)
+  uint32_t lateSwitchUs = 0;           // extra delay before its switch to SPEED1
+  bool xyDeaf = false;                 // the XY6's MIDI IN fails above 1x
   // Where it is.
   uint32_t baud = 31250;
   bool     turbo = false;              // at SPEED2 with the link up
@@ -48,6 +56,11 @@ struct Peer {
   bool     switchToTurbo = false;
   uint64_t ackDoneUs = 0, resultDoneUs = 0;   // when its 13 / 17 finished arriving
   uint32_t misframed = 0, reverts = 0;
+  // As the leader.
+  enum { M_IDLE, M_WAIT_CAPS, M_WAIT_ACK, M_WAIT_ECHO, M_WAIT_RES } m = M_IDLE;
+  uint64_t nextProbe = ~0ull, mDeadline = 0, xyAckDoneUs = 0, xyResultDoneUs = 0;
+  std::vector<uint8_t> afterSwitch;    // sent the moment its UART changes
+  uint32_t probes = 0;
   // Its receiver.
   size_t rd = 0;
   bool inSx = false;
@@ -92,7 +105,7 @@ struct Peer {
         speed1 = d[0]; speed2 = d[1];
         reply(0x13, nullptr, 0, t);
         ackDoneUs = txFree;
-        switchAt = txFree; switchBaud = kTmSpeeds[speed1]; switchToTurbo = false;
+        switchAt = txFree + lateSwitchUs; switchBaud = kTmSpeeds[speed1]; switchToTurbo = false;
         break;
       case 0x14: {
         uint8_t e[8] = {0};
@@ -101,6 +114,36 @@ struct Peer {
         reply(0x15, e, 8, t);
         break;
       }
+      // ---- as the leader: our answers ----
+      case 0x11:
+        if (m != M_WAIT_CAPS) break;
+        { const uint8_t sp[2] = {0x08, 0x07}; reply(0x12, sp, 2, t); speed1 = 8; speed2 = 7; }
+        m = M_WAIT_ACK; mDeadline = t + 500000;
+        break;
+      case 0x13:
+        if (m != M_WAIT_ACK) break;
+        xyAckDoneUs = t;
+        switchAt = t + 20; switchBaud = kTmSpeeds[speed1]; switchToTurbo = false;
+        afterSwitch.assign(16, 0x00);                  // its pad, at SPEED1
+        { const uint8_t tm[16] = {0xF0, 0x00, 0x20, 0x3C, 0x00, 0x00, 0x14,
+                                  0x55, 0x55, 0x55, 0x55, 0, 0, 0, 0, 0xF7};
+          afterSwitch.insert(afterSwitch.end(), tm, tm + 16); }
+        m = M_WAIT_ECHO; mDeadline = t + 300000;
+        break;
+      case 0x15: {
+        if (m != M_WAIT_ECHO) break;
+        const uint8_t want[8] = {0x55, 0x55, 0x55, 0x55, 0, 0, 0, 0};
+        if (n != 8 || memcmp(d, want, 8) != 0) { revert(); m = M_IDLE; break; }
+        reply(0x16, nullptr, 0, t);
+        m = M_WAIT_RES; mDeadline = t + 300000;
+        break;
+      }
+      case 0x17:
+        if (m != M_WAIT_RES) break;
+        xyResultDoneUs = t;
+        switchAt = t + 20; switchBaud = kTmSpeeds[speed2]; switchToTurbo = true;
+        m = M_IDLE;
+        break;
       case 0x16:
         if (!answersTest2) break;
         reply(0x17, nullptr, 0, t);
@@ -126,14 +169,24 @@ struct Peer {
       const bool haveSwitch = switchAt && switchAt <= now;
       if (!haveByte && !haveSwitch) break;
       if (haveSwitch && (!haveByte || switchAt <= sim::wire[rd].doneUs)) {
+        const uint64_t at = switchAt;
         baud = switchBaud; turbo = switchToTurbo; switchAt = 0;
         if (turbo) { lastXyFe = now; nextOwnFe = now; } else speed1Since = now;
+        if (!afterSwitch.empty()) { send(afterSwitch.data(), afterSwitch.size(), at);
+                                    afterSwitch.clear(); }
         continue;
       }
       const sim::WireByte& w = sim::wire[rd++];
       if (w.baud != baud) { misframed++; inSx = false; continue; }
       rx(w.b, w.doneUs);
     }
+    // As the leader: probe every 2 s at 1x, give up on a step after its deadline.
+    if (leads && m == M_IDLE && !turbo && baud == 31250 && !switchAt && now >= nextProbe) {
+      reply(0x10, nullptr, 0, now);
+      probes++;
+      m = M_WAIT_CAPS; mDeadline = now + 500000; nextProbe = now + 2000000;
+    }
+    if (leads && m != M_IDLE && now > mDeadline) { if (baud != 31250) revert(); m = M_IDLE; }
     // Its timeouts: active sensing, and a handshake that stalls at SPEED1.
     if (turbo && now - lastXyFe > 300000) revert();
     if (!turbo && baud != 31250 && !switchAt && now - speed1Since > 500000) revert();
@@ -147,7 +200,8 @@ struct Peer {
     }
     // Delivered to the XY6: intact at a matching speed, junk otherwise.
     while (!out.empty() && out.front().us <= now) {
-      Serial1.inject(out.front().baud == Serial1.baud() ? out.front().b : 0x00);
+      const bool heard = out.front().baud == Serial1.baud() && !(xyDeaf && Serial1.baud() > 31250);
+      Serial1.inject(heard ? out.front().b : 0x00);
       out.pop_front();
     }
   }
@@ -156,6 +210,7 @@ struct Peer {
 Peer peer;
 bool load = true;          // pattern + LFOs + stick running throughout
 bool sysexStress = false;  // our own SysEx on the wire, some of it in pieces
+bool displayStorm = false; // a full 8 KB panel push after every loop pass
 
 // One loop pass: the peer, the stick, the sketch, then 20 us of other work.
 void pass() {
@@ -182,6 +237,7 @@ void pass() {
     }
   }
   loop();
+  if (displayStorm) { g_shadowValid = false; flushAll(); }   // ~5 ms, MIDI pumped inside
   sim::nowNs += 20000;
 }
 void run(uint32_t ms) {
@@ -438,11 +494,118 @@ void scenarioSilentPeer() {
   common();
 }
 
+// v1.20: the machine leads, as the real one does with TURBO enabled. The XY6
+// answers, follows it to 10x within the machine's 0.5 ms pad, and locks at 8x.
+void scenarioMachineLeads() {
+  peer.leads = true;
+  boot();                                            // idle at 1x; answering is on
+  const size_t mark = sim::wire.size(), bc = sim::baudChanges.size();
+  peer.nextProbe = sim::nowUs() + 100000;
+  check(runUntil(2000, [] { return turbo.locked(); }), "the machine's handshake reaches LOCKED");
+  check(peer.turbo && peer.baud == 250000 && turbo.baud() == 250000, "both ends at 8x");
+  check(peer.probes == 1, "on the machine's first probe");
+  const std::vector<TmMsg> m = turboSentSince(mark);
+  const uint8_t pat[8] = {0x55, 0x55, 0x55, 0x55, 0, 0, 0, 0};
+  check(m.size() == 4, "exactly four answers sent");
+  if (m.size() == 4) {
+    check(m[0].cmd == 0x11 && m[0].d == std::vector<uint8_t>({0x7F, 0x01, 0x0F, 0x00}) &&
+          m[0].baud == 31250, "-> 11 7F 01 0F 00 at 31250");
+    check(m[1].cmd == 0x13 && m[1].d.empty() && m[1].baud == 31250, "-> 13 at 31250");
+    check(m[2].cmd == 0x15 && m[2].d == std::vector<uint8_t>(pat, pat + 8) && m[2].baud == 312500,
+          "-> 15 echo at 312500");
+    check(m[3].cmd == 0x17 && m[3].d.empty() && m[3].baud == 312500, "-> 17 at 312500");
+  }
+  uint64_t t10 = 0, t8 = 0;
+  for (size_t i = bc; i < sim::baudChanges.size(); ++i) {
+    if (sim::baudChanges[i].baud == 312500 && !t10) t10 = sim::baudChanges[i].us;
+    if (sim::baudChanges[i].baud == 250000 && !t8)  t8 = sim::baudChanges[i].us;
+  }
+  printf("      to 10x %.0f us after our 13 left, to 8x %.0f us after our 17\n",
+         (double)(t10 - peer.xyAckDoneUs), (double)(t8 - peer.xyResultDoneUs));
+  check(t10 >= peer.xyAckDoneUs && t10 - peer.xyAckDoneUs < 500,
+        "at 10x before the machine's 0.5 ms pad runs out");
+  bool quiet = true;
+  for (const auto& w : sim::wire) if (w.baud == 250000 && w.writeUs < t8 + kSpecSettleUs) quiet = false;
+  check(quiet, "10 ms of quiet after the switch to 8x");
+  run(2000);
+  check(turbo.locked() && peer.turbo && peer.reverts == 0, "the link stays up (keepalive heard)");
+  check(peer.misframed == 0, "the machine never received a byte at the wrong speed");
+  common();
+}
+
+// The same, with the XY6 inside a full-panel push nearly all the time: the
+// switch to 10x has to come from the pump inside the push, not from loop().
+void scenarioMachineBusy() {
+  peer.leads = true;
+  boot();
+  displayStorm = true;
+  peer.nextProbe = sim::nowUs() + 100000;
+  check(runUntil(2000, [] { return turbo.locked(); }),
+        "the machine's handshake reaches LOCKED with the display pushing frames");
+  check(peer.misframed == 0 && peer.reverts == 0, "no byte at the wrong speed, no retry needed");
+  displayStorm = false;
+  common();
+}
+
+// After 'turbo off' the machine's probes go unanswered - and say so once.
+void scenarioRefused() {
+  peer.leads = true;
+  boot();
+  handleCommand("turbo off");
+  const size_t mark = sim::wire.size(), bc = sim::baudChanges.size();
+  const size_t logFrom = Serial.captured.size();
+  peer.nextProbe = sim::nowUs() + 100000;
+  run(4500);                                         // three probes
+  check(peer.probes >= 3, "the machine kept asking");
+  check(turboSentSince(mark).empty() && noSwitchAfter(bc), "no answer, no switch");
+  const std::string log = Serial.captured.substr(logFrom);
+  size_t said = 0;
+  for (size_t at = 0; (at = log.find("not answering", at)) != std::string::npos; ++at) said++;
+  check(said == 1, "the refusal is logged once, not every probe");
+  handleCommand("turbo");                            // allowed again: our own attempt
+  check(runUntil(2500, [] { return turbo.locked(); }), "'turbo' brings it up again");
+  common();
+}
+
+// v1.20: a machine slower to change speed than the pad allows misses our
+// first test. The resend has to rescue it.
+void scenarioLatePeer() {
+  peer.lateSwitchUs = 3000;
+  boot();
+  const size_t mark = sim::wire.size();
+  handleCommand("turbo");
+  check(runUntil(1000, [] { return turbo.locked(); }), "reaches LOCKED despite the late switch");
+  size_t tests = 0;
+  for (const TmMsg& m : turboSentSince(mark)) tests += (m.cmd == 0x14);
+  printf("      %zu speed tests sent\n", tests);
+  check(tests >= 2, "the first test was missed and sent again");
+  common();
+}
+
+// v1.20: an XY6 whose MIDI IN cannot receive TurboMIDI speeds (a slow
+// optocoupler). The failure must say what arrived, and fall back cleanly.
+void scenarioDeaf() {
+  peer.xyDeaf = true;
+  boot();
+  const size_t logFrom = Serial.captured.size();
+  handleCommand("turbo");
+  run(TURBO_STEP_TIMEOUT_MS + TURBO_REVERT_HOLD_MS + 500);
+  check(!turbo.negotiating() && turbo.baud() == 31250, "falls back to 1X");
+  const std::string log = Serial.captured.substr(logFrom);
+  check(log.find("at 10X since the switch") != std::string::npos &&
+        log.find("none parse") != std::string::npos,
+        "the report says bytes arrived at 10X and none parsed");
+  common();
+}
+
 struct Scenario { const char* name; void (*fn)(); };
 const Scenario kScenarios[] = {
   {"happy", scenarioHappy},   {"nocaps", scenarioNoCaps}, {"noack", scenarioNoAck},
   {"badecho", scenarioBadEcho}, {"drop", scenarioDrop},   {"off", scenarioOff},
   {"silent", scenarioSilentPeer},
+  {"machine", scenarioMachineLeads}, {"busy", scenarioMachineBusy},
+  {"refused", scenarioRefused},
+  {"latepeer", scenarioLatePeer},    {"deaf", scenarioDeaf},
 };
 
 }  // namespace
@@ -455,6 +618,7 @@ int main(int argc, char** argv) {
     return failures ? 1 : 0;
   }
   printf("usage: turbo_test <");
-  for (const Scenario& s : kScenarios) printf("%s%s", s.name, &s == &kScenarios[6] ? ">\n" : "|");
+  const size_t n = sizeof kScenarios / sizeof kScenarios[0];
+  for (size_t i = 0; i < n; ++i) printf("%s%s", kScenarios[i].name, i + 1 == n ? ">\n" : "|");
   return 2;
 }
