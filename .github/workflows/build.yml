@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: host tests (g++, no Teensy toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test/host/run.sh
+
+  teensy40:
+    name: Teensy 4.0 compile
+    runs-on: ubuntu-latest
+    env:
+      PJRC_INDEX: https://www.pjrc.com/teensy/package_teensy_index.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install the Teensy platform
+        run: |
+          arduino-cli core update-index --additional-urls "$PJRC_INDEX"
+          arduino-cli core install teensy:avr --additional-urls "$PJRC_INDEX"
+      - name: Compile (USB Serial, 600 MHz)
+        run: arduino-cli compile --fqbn teensy:avr:teensy40:usb=serial,speed=600 --warnings all XY6_LFO

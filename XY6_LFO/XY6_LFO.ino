@@ -3,6 +3,40 @@
 // =============================================================================
 //
 // -----------------------------------------------------------------------------
+// WHAT CHANGED IN v1.18 - MIDI OUT LATENCY, JOYSTICK FEEL, FIVE FIXES
+// -----------------------------------------------------------------------------
+// Numbers are from test/host, which builds this file on a PC against a model
+// of the Teensy UART and runs it under a full stage load: pattern on all six
+// tracks, six LFOs, the stick on all six tracks, 31250 baud.
+//  * NOTES FIRST, FOR REAL. midiTxService() filled Serial1's 576-byte TX ring
+//    whenever it had room, so the backlog sat in the UART where nothing can
+//    reorder it, and a note-on waited behind every CC already handed over.
+//    The UART now holds at most ~3 ms of wire (MIDI_TX_LEAD_US); the rest waits
+//    in qNote / qCtrl, where notes do go first and JOY_Q_CAP does bite.
+//    Note latency p99 12-15 ms -> 8.6 ms; worst 15 -> 9.9 ms.
+//  * JOYSTICK SMOOTHING (JOY_FAST_CNT): a median of three, then the same
+//    one-pole, which follows real motion at 3/4 per pass instead of 1/4. A
+//    throw reaches 90% in 24 ms, was 64. A spike (a worn wiper) is removed
+//    instead of averaged in: a stick held off centre with one spike every 2 s
+//    sent 105 CCs a minute per track, now none. At rest it is as quiet as
+//    before; JOY_FAST_CNT 0 restores the v1.17 filter exactly.
+//  * FIX: moving BASE CH while notes sounded sent their note-offs - and the
+//    p-lock restores - to the NEW channel: stuck notes, stuck locks. Every
+//    channel change now goes through setBaseChannel(), which releases the old.
+//  * FIX: the turbo fallback's All Notes Off used the compile-time channel.
+//  * FIX: a track taken off the stick and put back later was sent the
+//    resting 64 at once, overwriting its patch value.
+//  * FIX: the stick's own CCs echoed through a THRU / merge counted as someone
+//    at the machine and held the LFOs at the 15 Hz back-off.
+//  * FIX: SAVE pressed during a save showed NO EEPROM over a save that was
+//    working; 'wipe' during a save printed "cleared" and wrote nothing.
+//  * uiNextPage() is declared instead of relying on the IDE's generated
+//    prototypes, so the sketch also builds as plain C++. Clean at -Wall
+//    -Wextra. Out-of-date comments and help text corrected (LFO 1 is TRIG,
+//    presets are wired, rmap default 41, turbo ack default 1); two unused
+//    #defines removed. The sketch now lives in XY6_LFO/XY6_LFO.ino.
+//
+// -----------------------------------------------------------------------------
 // WHAT CHANGED IN v1.17 - JOYSTICK TO ONE, SOME OR ALL TRACKS
 // -----------------------------------------------------------------------------
 //  * The stick plays any set of Monomachine tracks: one, all six, or any mix,
@@ -235,7 +269,8 @@
 //
 // Six Monomachine-exact LFOs phase-locked to the Monomachine's sequencer over
 // MIDI clock, a melodic pattern generator on the same wire, and a rebuilt OLED
-// UI. Put this file in a folder called XY6_LFO_3 and open it.
+// UI. The Arduino IDE wants the sketch in a folder of the same name, so this
+// file lives in XY6_LFO/ - open XY6_LFO/XY6_LFO.ino.
 //
 // -----------------------------------------------------------------------------
 // TURBO MIDI  (new in v4)
@@ -486,9 +521,8 @@
 //                  presets, MIDI, turbo, display, and the live LINK block that
 //                  used to be the DIAG page - RX/TX counters, buffer peak,
 //                  turbo state and baud, and the last SysEx header received.
-//                  PRESET SAVE/LOAD ARE NOT WIRED: the 24-series EEPROM at
-//                  0x50 has no driver in this firmware yet, and the rows say so
-//                  rather than pretending.
+//                  SAVE / LOAD / DELETE write the 24LC512 at 0x50 through the
+//                  non-blocking driver (see PRESET STORE).
 //
 //   LFO edit       enc1 PAGE   enc2 DEST   enc3 WAVE   enc4 MULT   enc5 SPD
 //                  enc6 DPTH
@@ -506,10 +540,10 @@
 //                  enc4 push : mute/unmute cursor track
 //                  enc5 push : cycle scale
 //
-//   OUT OF THE BOX: LFO 1 is FREE, so it animates the moment you power up and
-//   you can confirm the whole chain with the sequencer stopped. LFOs 2-6 are
-//   TRIG, so they start on play and lock to the bar. None of them transmit
-//   until they are actually driving, so a cold boot never disturbs your patch.
+//   OUT OF THE BOX: all six LFOs are TRIG (v1.17), so they start on play and
+//   lock to the bar. None of them transmit until they are actually driving, so
+//   a cold boot never disturbs your patch. 'clk i' runs them on the internal
+//   clock to check the chain with no Monomachine attached.
 //
 //   At boot all five LEDs light in turn, GPB0..GPB4 = D2 D3 D4 D5 D1. The last
 //   one in that sweep is the tempo LED; after the sweep it blinks the beat.
@@ -848,8 +882,8 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define TURBO_DEFAULT_SPEED       7
 
 // Ask the machine which speeds it supports (SysEx 0x10) before setting one.
-// Harmless either way — if no answer arrives we set the speed regardless,
-// which is what the TM-1 and MegaCommand both do.
+// Since v6 no answer is a NO: the switch is abandoned rather than made
+// one-sided. 0 skips the question and asks for the speed straight away.
 #define TURBO_QUERY_FIRST         1
 
 // After the switch, probe the machine at the NEW baud and wait for a sane
@@ -867,7 +901,6 @@ static uint8_t uiContrast = OLED_CONTRAST;
 // stream ever stops, and the pattern generator holds long notes.
 #define TURBO_SEND_ACTIVE_SENSE   0
 
-// Shown on the boot screen and by the console. One place, so it cannot drift.
 // ---- PERF page switches -----------------------------------------------------
 // Hoisted here from the page body because drawTurboBadgeBig() is defined ~350
 // lines ABOVE the page and is now conditional on them. A #define that sits
@@ -876,7 +909,8 @@ static uint8_t uiContrast = OLED_CONTRAST;
 // 0 = the old 70-row capsules with the TURBO badge in the gap between banks.
 #define PERF_FULL_FADERS   1
 
-#define XY6_VERSION              "1.17"
+// Shown on the boot screen and by the console. One place, so it cannot drift.
+#define XY6_VERSION              "1.18"
 
 // ---- Joystick (A0 / A1) -----------------------------------------------------
 // v1.17: the stick sends X and Y to every track picked on the JOY page (PERF
@@ -946,6 +980,17 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define JOY_STILL_MS     300
 #define JOY_DRIFT_MAX     80
 #define JOY_RAW_HYST       3
+// v1.18: SMOOTHING THAT DOES NOT LAG A REAL MOVE. The v1.17 filter was a plain
+// one-pole at 1/4 per 8 ms pass, so a fast throw took ~64 ms to reach 90% of
+// where the stick already was. Now each reading goes through a median of the
+// last three first - a single spike (a worn wiper lifting, a noisy ground) is
+// removed outright instead of being smeared into the average - and a median
+// more than JOY_FAST_CNT counts from the filter is motion, not noise, so the
+// filter follows it at 3/4 per pass: ~24 ms to 90%. Noise never gets near
+// JOY_FAST_CNT, so a resting stick still sees the same 1/4 one-pole - only
+// fed a median, which makes rest quieter, never busier. The rest centre, the
+// deadzone and the send threshold are untouched. 0 = the v1.17 filter.
+#define JOY_FAST_CNT      16
 #define JOY_INTERVAL_US 8000        // 125 Hz ceiling
 // v1.14: the PERF page's X/Y meters hide themselves when the stick is idle.
 // Shown while the stick is off centre or has moved in the last JOY_HIDE_MS;
@@ -988,9 +1033,7 @@ static void joyForget(bool x, bool y) {
 // The LIVE base channel (settings page / preset). Defined here, not with the
 // rest of the MIDI state, because the pattern generator far above needs it.
 static uint8_t txChannel = MNM_BASE_CHANNEL;
-#define AMP_DEC_SLOT              2   // amp-page slot for DECAY -> YY 0x0A
-#define MNM_SEND_ON_TRACK_CHANNEL 0   // 1 = send on base+track instead of base
-#define DEBUG_PRINT               1   // USB serial status twice a second
+#define DEBUG_PRINT               1   // one-line USB status every 2 s
 
 // ================================ pin map ====================================
 
@@ -2051,15 +2094,57 @@ static MidiQueue qNote;   // drained first — musical timing
 static MidiQueue qCtrl;   // drained with whatever room is left
 static uint32_t  txBytesOut = 0;
 
+// -----------------------------------------------------------------------------
+// v1.18: THE UART ONLY GETS A FEW MILLISECONDS AHEAD
+// -----------------------------------------------------------------------------
+// Serial1's software TX ring is 576 bytes (64 in the core + 512 added in
+// setup()) - 184 ms of wire at 31250 baud. midiTxService() used to fill it
+// whenever it had room, so the queues were nearly always empty and the real
+// backlog sat in the UART, where nothing can jump the line. "Notes drain
+// first" only decided the order bytes ENTERED the ring: a note-on queued
+// behind a stick sweep and six LFOs still waited for every CC byte already in
+// there. Measured on the host model (test/host) under a full stage load:
+// notes 6.5-8.5 ms late typically, 15 ms at worst. JOY_Q_CAP could not work
+// either - it caps the stick's share of qCtrl, and qCtrl read empty.
+//
+// So the UART is handed at most MIDI_TX_LEAD_US of wire time; everything else
+// waits in the queues, where notes really do go first and the stick's cap
+// really does apply. midiTxService() runs on every loop pass and every 256
+// bytes of a display push, far more often than the lead takes to drain, so
+// the wire never goes idle for it.
+#define MIDI_TX_LEAD_US   3000    // wire time the UART may hold ahead of us
+#define MIDI_TX_LEAD_MIN    12    // ...but never fewer bytes than this
+static int g_txCap  = 0;          // Serial1 availableForWrite() when idle (setup)
+static int g_txLead = MIDI_TX_LEAD_MIN;
+
+// Called for every baud the port is given. 3 ms is 12 bytes at 31250 (the
+// floor) and 75 at 8x turbo.
+static void midiTxSetBaud(uint32_t baud) {
+  int lead = (int)((baud / 10u) * MIDI_TX_LEAD_US / 1000000u);
+  if (lead < MIDI_TX_LEAD_MIN) lead = MIDI_TX_LEAD_MIN;
+  g_txLead = lead;
+}
+
+// May an n-byte message go into the UART now? It needs the room, and it must
+// not take the ring past the lead - unless the ring is empty, so a message
+// longer than the lead (the 31-byte turbo blob) still goes out whole.
+static inline bool midiTxFits(int n, int room, int inRing) {
+  if (room < n) return false;
+  return inRing <= 0 || inRing + n <= g_txLead;
+}
+
 // Push whole messages into the port while it has room for them. Called from the
 // main loop and from inside the display flush, so a frame push can never leave
 // a note sitting in the queue for a millisecond.
 static void midiTxService() {
   int room = Serial1.availableForWrite();
+  // Bytes in the ring not yet on the wire. Before setup() has measured the
+  // ring (g_txCap 0) there is no lead limit - the pre-v1.18 behaviour.
+  int inRing = g_txCap ? g_txCap - room : 0;
   for (;;) {
     const uint8_t n = qNote.peekLen();
-    if (!n || room < (int)n) break;
-    qNote.popTo(&Serial1); room -= n; txBytesOut += n;
+    if (!n || !midiTxFits(n, room, inRing)) break;
+    qNote.popTo(&Serial1); room -= n; inRing += n; txBytesOut += n;
   }
   // While a speed change is in flight the note queue is the only thing allowed
   // out: the turbo blob is sitting in it, and the negotiator is waiting for the
@@ -2067,10 +2152,14 @@ static void midiTxService() {
   // squeezed in behind the blob would push that moment further away and would
   // be transmitted at whichever baud won the race.
   if (turboHoldsWire()) return;
+  // v1.18: notes first, strictly. A note-queue message still waiting means the
+  // lead is full; a CC slipped in now would take its place - and could keep a
+  // message longer than the lead waiting for an empty ring indefinitely.
+  if (qNote.pending()) return;
   for (;;) {
     const uint8_t n = qCtrl.peekLen();
-    if (!n || room < (int)n) break;
-    qCtrl.popTo(&Serial1); room -= n; txBytesOut += n;
+    if (!n || !midiTxFits(n, room, inRing)) break;
+    qCtrl.popTo(&Serial1); room -= n; inRing += n; txBytesOut += n;
   }
 }
 
@@ -3874,7 +3963,7 @@ class LfoEngine {
       // to the conditional-trig test below. Order matters: rolling first means
       // a 25% FIRST-pass step fires on a quarter of the first passes rather
       // than on every first pass a quarter of the time.
-      const uint8_t pct = kStepProbPct[st.prob < PROB_COUNT ? st.prob : PROB_100];
+      const uint8_t pct = kStepProbPct[st.prob < PROB_COUNT ? st.prob : (uint8_t)PROB_100];
       if (pct == 0) continue;
       if (pct < 100 && (rand32() % 100u) >= pct) continue;
 
@@ -4405,6 +4494,21 @@ class MnmOutput {
 };
 
 static MnmOutput mnmOut;
+
+// v1.18: THE ONE WAY TO MOVE THE BASE CHANNEL. The settings page and the 'ch'
+// command both assigned txChannel directly - and every note-off and p-lock
+// restore is addressed from txChannel at the moment it is SENT. A note playing
+// when the channel moved got its note-off on the new channel, so it never
+// stopped; a locked parameter was restored on the new channel and stayed
+// locked on the old. Release everything on the old channel first. The stick
+// forgets what it sent too: those values were for the old channels.
+static void setBaseChannel(uint8_t ch) {
+  if (ch < 1 || ch > 16 || ch == txChannel) return;
+  patSilenceAll();              // note-offs and lock restores, old channel
+  txChannel = ch;
+  joyForget(true, true);
+  mnmOut.resend();
+}
 
 // =============================================================================
 // SCENES (v1.11) - FROST, FOG, DRILL
@@ -5277,7 +5381,7 @@ class TurboMidi {
                   kTmNames[n], ackPending_ ? " and acking at the new baud" : "");
   }
 
-  void service(uint32_t nowMs, uint32_t nowUs) {
+  void service(uint32_t nowMs, uint32_t /*nowUs*/) {
     serviceSweep(nowMs);
     switch (st_) {
       case QUERY:
@@ -5544,6 +5648,7 @@ class TurboMidi {
     // were valid MIDI at the new rate.
     tmPortRestart(kTmSpeeds[cur_]);   // extra RX/TX memory survives this
     mnmOut.setBaud(kTmSpeeds[cur_]);  // the CC budget grows with the wire
+    midiTxSetBaud(kTmSpeeds[cur_]);   // and so does the UART's lead (v1.18)
     sysex1.reset();
     midiRxReset();                    // running status / SPP from the old speed
     rxSeen_ = 0; anyRx_ = 0; probeAck_ = false;
@@ -5603,10 +5708,13 @@ class TurboMidi {
 
   // After a failed negotiation the machine may have received misframed bytes,
   // and a misframed byte can look like a note-on. Clear every channel we use.
+  // v1.18: the LIVE base channel. This used the compile-time MNM_BASE_CHANNEL,
+  // so with BASE CH moved on the settings page it silenced six channels
+  // nothing was playing on and left the six that were.
   void allNotesOff() {
     patSilenceAll();
     for (uint8_t t = 0; t < 6; ++t) {
-      const uint8_t ch = (uint8_t)(0xB0 | ((MNM_BASE_CHANNEL - 1 + t) & 0x0F));
+      const uint8_t ch = (uint8_t)(0xB0 | patChan(t));
       const uint8_t m[3] = {ch, 123, 0};        // All Notes Off
       qNote.push(m, 3);
     }
@@ -6537,7 +6645,7 @@ static void drawEdit(uint32_t absStep16, bool running) {
     b[3] = (char)('1' + ui.stepPage); b[4] = 0;
     const LfoStep& cs = p.steps[(ui.stepPage * sc + (ui.stepCur % sc)) % LFO_STEPS];
     if (!cs.on) { v[0]='O'; v[1]='F'; v[2]='F'; v[3]=0; }
-    else { u8s3(kStepProbPct[cs.prob < PROB_COUNT ? cs.prob : PROB_100], v);
+    else { u8s3(kStepProbPct[cs.prob < PROB_COUNT ? cs.prob : (uint8_t)PROB_100], v);
            v[3] = '%'; v[4] = 0; }
     stRow(93, b, v, false); }
 
@@ -6557,7 +6665,7 @@ static void drawEdit(uint32_t absStep16, bool running) {
     const bool cur = ((ui.stepCur % sc) == k);
     const bool isLive = running && ((uint16_t)(ui.stepPage * sc + k) == live);
     stCell(sx, sy, SQ, st.on ? kStepProbPct[st.prob < PROB_COUNT ? st.prob
-                                                                : PROB_100] : 0,
+                                                                : (uint8_t)PROB_100] : 0,
            cur || isLive);
     if (cur) gfx.rect((int16_t)(sx - 2), (int16_t)(sy - 2),
                       (int16_t)(SQ + 4), (int16_t)(SQ + 4), SH_MID);
@@ -7287,9 +7395,9 @@ static void encEdit(const int8_t* d) {
     const uint8_t sc  = (p.stepCount == 8) ? 8 : 16;
     const uint8_t idx = (uint8_t)((ui.stepPage * sc + (ui.stepCur % sc)) % LFO_STEPS);
     LfoStep& st = p.steps[idx];
-    uint8_t pr = st.on ? st.prob : PROB_OFF;
+    uint8_t pr = st.on ? st.prob : (uint8_t)PROB_OFF;
     pr = addClamp(pr, d[3], 0, (uint8_t)(PROB_COUNT - 1));
-    st.prob = pr ? pr : PROB_100;      // keep a sane value behind an off step
+    st.prob = pr ? pr : (uint8_t)PROB_100;   // keep a sane value behind an off step
     st.on   = pr ? 1 : 0;
   }
 
@@ -7680,7 +7788,7 @@ struct Store {
       d.stepCount = L.stepCount;
       d.flags = L.enabled ? 1 : 0;
       for (uint8_t k = 0; k < EE_LFO_STEPS; ++k)
-        d.steps[k].prob = L.steps[k].on ? L.steps[k].prob : PROB_OFF;
+        d.steps[k].prob = L.steps[k].on ? L.steps[k].prob : (uint8_t)PROB_OFF;
     }
     gRec.pat.seed  = pat.seed;
     gRec.pat.genre = pat.genre; gRec.pat.bars = pat.bars;
@@ -7746,7 +7854,7 @@ struct Store {
       L.enabled = (d.flags & 1) != 0;
       for (uint8_t k = 0; k < EE_LFO_STEPS; ++k) {
         const uint8_t pr = (uint8_t)(d.steps[k].prob % PROB_COUNT);
-        L.steps[k].prob = pr ? pr : PROB_100;
+        L.steps[k].prob = pr ? pr : (uint8_t)PROB_100;
         L.steps[k].on   = pr ? 1 : 0;
       }
     }
@@ -7794,8 +7902,17 @@ struct Store {
     // a picture over it.
     HalEeprom::beginRead(EE_ADDR_GLOBAL, (uint8_t*)&gGlobal, sizeof(gGlobal));
   }
-  static void saveTo(uint8_t slot) {
-    if (busy() || !HalEeprom::present()) { strcpy(storeMsg, "NO EEPROM"); return; }
+  // v1.18: may an operation start? A busy store used to answer "NO EEPROM" -
+  // so a second press of SAVE during a save put NO EEPROM on the screen, over
+  // the progress bar of a save that was working fine. Busy now leaves the
+  // running operation's own message alone, and the caller hears "no".
+  static bool canStart() {
+    if (busy()) return false;
+    if (!HalEeprom::present()) { strcpy(storeMsg, "NO EEPROM"); return false; }
+    return true;
+  }
+  static bool saveTo(uint8_t slot) {
+    if (!canStart()) return false;
     storeSlot = (uint8_t)(slot % EE_PRESET_SLOTS);
     packInto(storeSlot);
     storeErasing = false;
@@ -7803,19 +7920,21 @@ struct Store {
     strcpy(storeMsg, "SAVING");
     HalEeprom::beginWrite((uint16_t)(EE_PRESET_BASE + EE_PRESET_STRIDE * storeSlot),
                           (const uint8_t*)&gRec, sizeof(PresetP));
+    return true;
   }
-  static void loadFrom(uint8_t slot) {
-    if (busy() || !HalEeprom::present()) { strcpy(storeMsg, "NO EEPROM"); return; }
+  static bool loadFrom(uint8_t slot) {
+    if (!canStart()) return false;
     storeSlot = (uint8_t)(slot % EE_PRESET_SLOTS);
     storeOp = ST_LOAD_REC;
     strcpy(storeMsg, "LOADING");
     HalEeprom::beginRead((uint16_t)(EE_PRESET_BASE + EE_PRESET_STRIDE * storeSlot),
                          (uint8_t*)&gRec, sizeof(PresetP));
+    return true;
   }
   // "Delete" clears the record's magic so the slot reads as empty. Erasing 4 KB
   // to 0xFF would cost 128 write cycles for no gain: the magic IS the tenancy.
-  static void eraseSlot(uint8_t slot) {
-    if (busy() || !HalEeprom::present()) { strcpy(storeMsg, "NO EEPROM"); return; }
+  static bool eraseSlot(uint8_t slot) {
+    if (!canStart()) return false;
     storeSlot = (uint8_t)(slot % EE_PRESET_SLOTS);
     memset(&gRec.hdr, 0, sizeof(gRec.hdr));
     storeErasing = true;
@@ -7823,6 +7942,7 @@ struct Store {
     strcpy(storeMsg, "DELETING");
     HalEeprom::beginWrite((uint16_t)(EE_PRESET_BASE + EE_PRESET_STRIDE * storeSlot),
                           (const uint8_t*)&gRec, sizeof(PresetHdrP));
+    return true;
   }
   static void writeGlobals() {
     gGlobal.magic   = XY6_MAGIC_GLOBAL;
@@ -8052,11 +8172,8 @@ static void wizAdvance() {
 // reading the device-id bytes off the panel is the single fastest way to find
 // out why a handshake is going nowhere.
 //
-// PRESETS ARE NOT WIRED YET. The rows are drawn and the slot selector works,
-// but SAVE and LOAD say so rather than pretending. The 24-series EEPROM at
-// 0x50 is on the bus and has never been touched by this firmware; giving it a
-// driver, a versioned layout and a serialiser for six LfoParams plus the whole
-// PatState is its own job, not a rider on a UI change.
+// PRESETS: SAVE / LOAD / DELETE act on the SLOT row through Store (above), a
+// state machine on the 1 kHz EEPROM tick, so nothing here waits on the part.
 enum SetKind : uint8_t { SK_HEAD = 0, SK_VAL, SK_ACT, SK_INFO };
 enum : uint8_t {
   SI_SLOT = 1, SI_SAVE, SI_LOAD,
@@ -8190,7 +8307,7 @@ static void setValue(uint8_t id, char* out, uint8_t cap) {
 static void setAdjust(uint8_t id, int8_t d) {
   switch (id) {
     case SI_SLOT:   presetSlot = addClamp(presetSlot, d, 1, EE_PRESET_SLOTS); break;
-    case SI_CH:     txChannel = addClamp(txChannel, d, 1, 16); mnmOut.resend(); break;
+    case SI_CH:     setBaseChannel(addClamp(txChannel, d, 1, 16)); break;
     case SI_PERTRK: txPerTrack = !txPerTrack; mnmOut.resend(); break;
     case SI_MODE:   txMode = addClamp(txMode, d, 0, 3); mnmOut.resend(); break;
     case SI_TSPEED: setTurboSel = addClamp(setTurboSel, d, 0, 4); break;
@@ -8230,17 +8347,17 @@ static void setActivate(uint8_t id) {
     // bare Serial.printf into a host that has stopped draining spins for up to
     // 120 ms - about 3750 received bytes at 250000 baud.
     case SI_SAVE:
-      Store::saveTo((uint8_t)(presetSlot - 1));
-      tmSerial.printf("preset: saving slot %u (%u bytes)\n",
-                      presetSlot, (unsigned)sizeof(PresetP));
+      if (Store::saveTo((uint8_t)(presetSlot - 1)))
+        tmSerial.printf("preset: saving slot %u (%u bytes)\n",
+                        presetSlot, (unsigned)sizeof(PresetP));
       break;
     case SI_LOAD:
-      Store::loadFrom((uint8_t)(presetSlot - 1));
-      tmSerial.printf("preset: loading slot %u\n", presetSlot);
+      if (Store::loadFrom((uint8_t)(presetSlot - 1)))
+        tmSerial.printf("preset: loading slot %u\n", presetSlot);
       break;
     case SI_DELETE:
-      Store::eraseSlot((uint8_t)(presetSlot - 1));
-      tmSerial.printf("preset: clearing slot %u\n", presetSlot);
+      if (Store::eraseSlot((uint8_t)(presetSlot - 1)))
+        tmSerial.printf("preset: clearing slot %u\n", presetSlot);
       break;
     case SI_TGO:
       turbo.requestSpeed(kSetTurboIdx[setTurboSel], millis());
@@ -8412,6 +8529,10 @@ static const SubRingEntry kSubRing[] = {
 static const uint8_t SUB_RING_N = sizeof(kSubRing) / sizeof(kSubRing[0]);
 
 static void uiNextSub();
+// v1.18: declared, not left to the Arduino IDE's generated prototypes - the
+// only function in the file that relied on them, so any other C++ toolchain
+// (the host test in test/host, PlatformIO with a .cpp) failed right here.
+static void uiNextPage();
 // v1.16: the board button's two actions, as functions, so the console can
 // drive exactly the same state machine the button does ('click', 'hold').
 static void uiBoardHold() {
@@ -8868,6 +8989,23 @@ static bool captureCc(uint8_t ch, uint8_t cc, uint8_t val) {
     lfo.setCapture(i, val);
     rxCapture++;
   }
+
+  // ---- joystick (v1.18) ----------------------------------------------------
+  // The stick's own CCs coming back through a THRU or a merge. The two loops
+  // above know nothing about them, so every echoed stick move counted as a
+  // person at the machine and held the LFOs at the 15 Hz back-off for as long
+  // as the stick moved - bug 5 of the previous revision, again, by a new
+  // route. Matched on track and CC within 100 ms of the stick sending there,
+  // not on value: the stick moves on before its echo gets back.
+  const uint8_t jx = joyDestCC(g_joyDestX), jy = joyDestCC(g_joyDestY);
+  if (cc == jx || cc == jy) {
+    const uint32_t nowMs = millis();
+    for (uint8_t t = 0; t < 6; ++t) {
+      if (!(g_joyMask & (1u << t)) || !g_joyActMs[t]) continue;
+      if (ch != (uint8_t)((txChannel - 1 + t) & 0x0F)) continue;
+      if ((uint32_t)(nowMs - g_joyActMs[t]) < 100u) { matched = true; ours = true; }
+    }
+  }
   // A CC that matched one of our destinations and carried exactly the value we
   // last put there is our own echo. Anything else is a person.
   return !(matched && ours);
@@ -9111,8 +9249,8 @@ static void printHelp() {
     "  turbo          negotiate the compiled-in default speed\n"
     "  turbo off      back to 31250 baud   |   turbo ?   link state\n"
     "  turbo v        toggle raw hex logging of turbo messages\n"
-    "  turbo ack <n>  when to ack an incoming 0x12: 0 never, 1 old baud,\n"
-    "                 2 after switching at the new baud (default)\n"
+    "  turbo ack <n>  when to ack an incoming 0x12: 0 never, 1 old baud\n"
+    "                 (default, as the manual says), 2 at the new baud\n"
     "  turbo sweep    walk the device-id field 00..7F looking for ANY answer.\n"
     "                 Use when both data paths work but a speed request goes\n"
     "                 unanswered - it is the last software reason the machine\n"
@@ -9137,9 +9275,8 @@ static void printHelp() {
     "  joy            joystick routing. joy all | off | 1-6 (solo) | tog <n>\n"
     "                 joy x <i> | y <i> (destination 0-56) | sweep <s> (dry run)\n"
     "  invert 0 | 1   reverse black and white across the whole OS\n"
-    "  style 0 | 1    chip fills, or the same layout in strokes\n"
-    "  font 3 | font 5  3x5 mockup font, or 5x7 legible font\n"
     "  style 0 | 1    chip style: 1 inverted blocks, 0 strokes on black\n"
+    "  font 3 | font 5  3x5 mockup font, or 5x7 legible font\n"
     "  boot           replay the startup logo animation\n"
     "  clk i | clk e  internal clock (no MnM needed) or external\n"
     "  bpm <n>        internal tempo\n"
@@ -9148,7 +9285,7 @@ static void printHelp() {
     "  uiw <8-64>     usable panel width; pages relay out live\n"
     "  mux <15-63>    multiplex ratio (63 = all 64 rows)   <- try this first\n"
     "  stl <0-63>     display start line     offs <0-63>  display offset\n"
-    "  rmap <hex>     re-map byte (default 43; try 03 if half the panel is dark)\n"
+    "  rmap <hex>     re-map byte (default 41; try 01 if half the panel is dark)\n"
     "  bright <0-255> contrast\n"
     "  wr <8-200>     /WR pulse width in nops - raise it if the screen speckles\n"
     "  fmode 0 | 1    frame send: 1 = stress-test stream, 0 = v1.08 chunks\n"
@@ -9213,14 +9350,15 @@ static void printStatus() {
       (unsigned long)dispHealMs, (unsigned long)g_healCount,
       dispHealMs ? "" : "   [DISABLED - glitches will persist]");
   Serial.printf("TX      ch %u (base %u%s)  mode %u %s\n",
-      (unsigned)(txChannel + (txPerTrack ? p.track : 0)), txChannel,
+      (unsigned)(((txChannel - 1 + (txPerTrack ? p.track : 0)) & 0x0F) + 1), txChannel,
       txPerTrack ? " + track" : "", txMode, kTxModeName[txMode & 3]);
   Serial.printf("        %lu B/s on the wire  |  queues: note %u pend %lu drop,"
                 "  ctrl %u pend %lu drop\n",
       (unsigned long)txRate, (unsigned)qNote.pending(),
       (unsigned long)qNote.drops(), (unsigned)qCtrl.pending(),
       (unsigned long)qCtrl.drops());
-  Serial.printf("        baud 31250 (3125 B/s)  total sent %lu  notes %lu\n",
+  Serial.printf("        baud %lu (%lu B/s)  total sent %lu  notes %lu\n",
+      (unsigned long)turbo.baud(), (unsigned long)(turbo.baud() / 10u),
       (unsigned long)txBytesOut, (unsigned long)patNotesSent);
   usbWait(128);
   Serial.printf("TARGET  track %u  page %s  slot %u %s  %s %u%s\n",
@@ -9314,19 +9452,27 @@ static void handleCommand(const char* c) {
   if (isCmd(c, "hx")) { huntMode = 0; Serial.println("hunt stopped"); return; }
   if (isCmd(c, "save")) { a = parseArg(c, false);
     if (a >= 1 && a <= EE_PRESET_SLOTS) presetSlot = (uint8_t)a;
-    Store::saveTo((uint8_t)(presetSlot - 1));
-    Serial.printf("saving slot %u (%u bytes, non-blocking)\n",
-                  presetSlot, (unsigned)sizeof(PresetP));
+    if (Store::saveTo((uint8_t)(presetSlot - 1)))
+      Serial.printf("saving slot %u (%u bytes, non-blocking)\n",
+                    presetSlot, (unsigned)sizeof(PresetP));
+    else Serial.printf("not saved: %s\n", Store::busy() ? "store busy - try again" : storeMsg);
     return; }
   if (isCmd(c, "load")) { a = parseArg(c, false);
     if (a >= 1 && a <= EE_PRESET_SLOTS) presetSlot = (uint8_t)a;
-    Store::loadFrom((uint8_t)(presetSlot - 1));
-    Serial.printf("loading slot %u\n", presetSlot);
+    if (Store::loadFrom((uint8_t)(presetSlot - 1)))
+      Serial.printf("loading slot %u\n", presetSlot);
+    else Serial.printf("not loaded: %s\n", Store::busy() ? "store busy - try again" : storeMsg);
     return; }
   if (isCmd(c, "wipe")) {
     // Clears the globals only, so the next boot runs the first-run wizard. The
     // preset slots themselves are left alone - "show me the wizard again" and
     // "destroy my presets" are very different requests.
+    // v1.18: never mid-operation. The EEPROM driver refuses a second write
+    // while one is running, so 'wipe' during a save printed "cleared", wrote
+    // nothing, and threw away the save's own globals update.
+    if (Store::busy() || !HalEeprom::present()) {
+      Serial.println(Store::busy() ? "store busy - try again" : "no EEPROM");
+      return; }
     memset(&gGlobal, 0, sizeof(gGlobal));
     Store::writeGlobals();
     Serial.println(F("globals cleared - next boot runs the first-run wizard.\n"
@@ -9366,7 +9512,7 @@ static void handleCommand(const char* c) {
     if (a >= 0 && a <= 3) { txMode = (uint8_t)a; mnmOut.resend();
       Serial.printf("mode %ld  %s\n", a, kTxModeName[a]); } return; }
   if (isCmd(c, "ch")) { a = parseArg(c, false);
-    if (a >= 1 && a <= 16) { txChannel = (uint8_t)a; mnmOut.resend();
+    if (a >= 1 && a <= 16) { setBaseChannel((uint8_t)a);
       Serial.printf("MIDI channel %ld\n", a); } return; }
   if (isCmd(c, "tr")) { a = parseArg(c, false);
     if (a >= 1 && a <= 6) { lfo.p[0].track = (uint8_t)(a - 1); mnmOut.resend();
@@ -9621,13 +9767,14 @@ static void handleCommand(const char* c) {
       "labelled with its first row number. Count the bands you can see - that\n"
       "is exactly which COM lines are dark, which is what mux/stl/offs act on.\n"
       "\n"
-      "IF ABOUT HALF THE BANDS ARE MISSING, TRY THIS FIRST:   rmap 03\n"
+      "IF ABOUT HALF THE BANDS ARE MISSING, TRY THIS FIRST:   rmap 01\n"
       "\n"
-      "The re-map byte is 0x43 today, and bit 6 of it enables COM split\n"
+      "The re-map byte is 0x41 today, and bit 6 of it enables COM split\n"
       "odd/even. A panel wired for sequential COM but told to split drives\n"
-      "only half its rows. 0x03 keeps the column and nibble remap this panel\n"
-      "needs and clears the split. If that fixes it, put 0xA0, 0x03 into\n"
-      "INIT_SEQ and raise UI_W to 64. If not: mux 63 -> stl 0 -> offs 0.\n"
+      "only half its rows. 0x01 keeps the column remap this panel needs\n"
+      "(bit 1 stays clear - see dispRemap) and clears the split. If that\n"
+      "fixes it, set dispRemap and the 0xA0 line of INIT_SEQ to 0x01 and\n"
+      "raise UI_W to 64. If not: mux 63 -> stl 0 -> offs 0.\n"
       "'rows' again returns to the LFO page."));
     return; }
   if (isCmd(c, "led")) {
@@ -9828,9 +9975,8 @@ static void pollSerial() {
 
 // ================================ joystick ===================================
 //
-// OFF by default. The XY6 schematic puts a joystick on A0/A1 but no revision of
-// this firmware has ever read it, so switching it on changes what the box
-// transmits - that is your decision, not mine. Set JOYSTICK_ENABLED to 1.
+// ON since v1.10 (JOYSTICK_ENABLED in the config block). Set it to 0 and the
+// whole section compiles away - no RAM, no CCs, no meters on the PERF page.
 //
 // On the review question "can analogRead() block the serial read": no, and it
 // is not close. A Teensy 4 analogRead at the core's default 10-bit, 4x
@@ -9886,6 +10032,7 @@ struct JoyAxis {
   int16_t  held = 0;          // v1.17: reading after JOY_RAW_HYST
   int16_t  stillRef = 0;      // v1.17: where the stick last settled...
   uint32_t stillMs = 0;       //        ...and since when
+  int16_t  raw1 = 0, raw2 = 0;   // v1.18: the two readings before this one
 
   // A METHOD, not a free function taking JoyAxis&. See the note by destName():
   // the IDE hoists a prototype for every free function to the very top of the
@@ -9949,8 +10096,22 @@ static uint8_t joyMap(int raw, int centre, int lo, int hi, bool* inDead) {
 
 void JoyAxis::step(int raw, uint32_t nowMs) {
   if (!primed) { filt = (int32_t)raw << 4; primed = true;
-                 held = stillRef = (int16_t)raw; stillMs = nowMs; }
+                 held = stillRef = raw1 = raw2 = (int16_t)raw; stillMs = nowMs; }
+#if JOY_FAST_CNT
+  else {
+    // v1.18: median of three, then a one-pole that speeds up for real motion.
+    // See JOY_FAST_CNT.
+    const int a = raw, b = raw1, c = raw2;
+    const int med = (a > b) ? ((b > c) ? b : (a > c ? c : a))
+                            : ((a > c) ? a : (b > c ? c : b));
+    raw2 = raw1; raw1 = (int16_t)raw;
+    const int32_t e  = ((int32_t)med << 4) - filt;
+    const int32_t ae = (e < 0) ? -e : e;
+    filt += (ae > ((int32_t)JOY_FAST_CNT << 4)) ? ((e * 3) >> 2) : (e >> 2);
+  }
+#else
   else         filt += (((int32_t)raw << 4) - filt) >> 2;   // one-pole
+#endif
   const int sm = (int)(filt >> 4);
   // Learn the travel from the SMOOTHED reading, so one noisy sample cannot
   // stretch the range and leave the ends unreachable again.
@@ -10062,7 +10223,14 @@ static void joyTransmit(uint32_t nowMs, uint32_t nowUs) {
   const uint8_t first = joyRr;
   for (uint8_t k = 0; k < 6; ++k) {
     const uint8_t t = (uint8_t)((first + k) % 6);
-    if (!(g_joyMask & (1u << t))) { joyDueUs[t] = 0; continue; }
+    // v1.18: a track that is not under the stick forgets what it was sent. It
+    // used to keep it, so a track taken off and put back later - its last value
+    // 100, say, and the stick now resting - was due at once and got the resting
+    // 64, overwriting the patch: the one thing 0xFF exists to prevent.
+    if (!(g_joyMask & (1u << t))) {
+      joyDueUs[t] = 0; g_joySentX[t] = g_joySentY[t] = 0xFF;
+      continue;
+    }
     bool dx = (ccX != 0xFF) && joyX.due(g_joySentX[t], nowMs);
     bool dy = (ccY != 0xFF) && joyY.due(g_joySentY[t], nowMs);
     const uint8_t vx = joyX.pend, vy = joyY.pend;
@@ -10156,8 +10324,12 @@ static void joyService(uint32_t nowUs) {
     joyY.step(joyReadY(), nowMs);
   }
   if (joyDry) {
-    // The pretend wire: 3125 bytes a second, in milli-bytes.
-    joyDryAcc += (nowUs - joyDryLastUs) * 3125u / 1000u; joyDryLastUs = nowUs;
+    // The pretend wire: 3125 bytes a second, in milli-bytes. The gap is
+    // clamped like the budget refill above (v1.18): a console command that
+    // held the loop for 1.4 s would overflow the multiply.
+    uint32_t gapUs = nowUs - joyDryLastUs; joyDryLastUs = nowUs;
+    if (gapUs > 100000u) gapUs = 100000u;
+    joyDryAcc += gapUs * 3125u / 1000u;
     for (uint8_t n; (n = qJoyDry.peekLen()) != 0 && joyDryAcc >= (uint32_t)n * 1000u; ) {
       qJoyDry.discard(); joyDryAcc -= (uint32_t)n * 1000u; joyDryBytes += n;
     }
@@ -10237,8 +10409,11 @@ void setup() {
   qNote.reset();
   qCtrl.reset();
   // availableForWrite() on an idle port reports the whole buffer less one, and
-  // that value is how the negotiator recognises "the UART has gone empty".
-  turbo.begin(Serial1.availableForWrite());
+  // that value is how the negotiator recognises "the UART has gone empty" -
+  // and, since v1.18, how midiTxService() works out how much is in the ring.
+  g_txCap = Serial1.availableForWrite();
+  midiTxSetBaud(31250);
+  turbo.begin(g_txCap);
   // SERIAL1_RX_BUFFER_SIZE in the core is 64; addMemoryForRead adds to it.
   rxCapacity = (uint16_t)(64u + sizeof(serial1RxBuf));
 
@@ -10303,8 +10478,8 @@ void setup() {
                   mnmParamName(lfo.p[i].page, lfo.p[i].dest),
                   mnmCC(lfo.p[i].page, lfo.p[i].dest),
                   kTrigNames[lfo.p[i].trig]);
-  Serial.println(F("LFO 1 is FREE and is already running. Press PLAY on the\n"
-                   "Monomachine and the other five start, locked to the bar."));
+  Serial.println(F("All six LFOs are TRIG: press PLAY on the Monomachine and they\n"
+                   "start, locked to the bar ('clk i' runs them with no machine)."));
   Serial.println(F("If nothing moves, type  s  for status, then  hn  to hunt."));
   Serial.println(F("\nSerial Monitor line ending can be anything - commands also run on a\n"
                    "short pause, so 'No line ending' works too."));

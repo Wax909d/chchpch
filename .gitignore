@@ -1,0 +1,7 @@
+# Build output (Arduino IDE export, arduino-cli)
+build/
+*.hex
+*.elf
+# Editors and OS
+.vscode/
+.DS_Store
