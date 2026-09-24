@@ -32,7 +32,7 @@ This builds the sketch on a PC with g++ against a small model of the Teensy API
 | `midi_latency_test` | how late notes and stick CCs reach the MIDI wire under a full stage load (pattern, six LFOs, stick on six tracks) |
 | `joystick_filter_test` | stick step response, and that a resting or held stick sends nothing through ADC noise and spikes |
 | `regression_test` | one check for each bug fixed in v1.18 |
-| `turbo_test <scenario>` | TurboMIDI against a model of the Elektron machine, both ways round: the XY6 leading (byte for byte, keepalive, no caps, no ACK, bad echo, a machine slow to switch, machine power-cycled, `turbo off`, silent machine, a MIDI IN too slow for 10x) and the machine leading as a real one does (plain, during back-to-back display pushes, refused after `turbo off`) |
+| `turbo_test <scenario>` | TurboMIDI against a model of the Elektron machine, both ways round: the XY6 leading (byte for byte, keepalive, no caps, no ACK, bad echo, a machine slow to switch, machine power-cycled, `turbo off`, silent machine, a MIDI IN too slow for 10x) and the machine leading as a real one does (plain, during back-to-back display pushes, refused after `turbo off`), a MIDI IN that smears edges above 1x (the real test board's symptom), `turbo max`, and the `turbo loop` self-test |
 
 CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs these and a
 real Teensy 4.0 compile on every push.

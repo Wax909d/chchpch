@@ -3,6 +3,28 @@
 // =============================================================================
 //
 // -----------------------------------------------------------------------------
+// WHAT CHANGED IN v1.21 - WHY 10X FAILS ON THE TEST BOARD, AND WHAT TO DO ABOUT IT
+// -----------------------------------------------------------------------------
+// v1.20 on the real Monomachine: the machine led, we answered, both ends went
+// to 10x - and at 10x we received  10 00 00 FE F0 F0 F0 F0 F0 00 00 00 ...
+// Five F0s are the machine's test SysEx, sent five times: it WAS at 10x. Only
+// bytes with one long low stretch (F0 FE 00) survived; every edge-dense byte
+// of the message was mangled. That is a MIDI IN too slow for the speed.
+//  * FIX: the timeout report said "clock parses, the link works, the machine
+//    did not answer" - on the strength of one FE, a byte that survives almost
+//    any line. It now counts SysEx STARTED against SysEx ARRIVED WHOLE and
+//    says the machine is talking and the MIDI IN is mangling it.
+//  * 'turbo loop': OUT 1 patched to IN 1, machine unplugged - the same 32
+//    bytes (the real test SysEx and more) out and back at every speed from
+//    1x to 10x, and the fastest this MIDI IN passes cleanly.
+//  * 'turbo max <n>': a ceiling on both sides - the speeds we ask for when we
+//    lead (test at the ceiling, run one step below) and the speeds we OFFER
+//    in our 11 when the machine leads. 10 by default, which is exactly v1.20;
+//    'save' keeps it (it lives in the globals' unused turboSpeedIdx byte).
+//  * FIX: our SWITCH1 always went to 10x, whatever our 12 had asked for -
+//    harmless while the request was always 10x, fatal to any ceiling.
+//
+// -----------------------------------------------------------------------------
 // WHAT CHANGED IN v1.20 - TURBOMIDI RESPONDER, TEST RETRIES, A REASON FOR FAILURE
 // -----------------------------------------------------------------------------
 // From v1.19 on a real Monomachine: it sends 10 by itself every few seconds
@@ -972,7 +994,7 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define PERF_FULL_FADERS   1
 
 // Shown on the boot screen and by the console. One place, so it cannot drift.
-#define XY6_VERSION              "1.20"
+#define XY6_VERSION              "1.21"
 
 // ---- Joystick (A0 / A1) -----------------------------------------------------
 // v1.17: the stick sends X and Y to every track picked on the JOY page (PERF
@@ -5082,13 +5104,25 @@ static const uint8_t kTmTestPattern[8] = {0x55, 0x55, 0x55, 0x55, 0x00, 0x00, 0x
 // check is that SPEED1 and SPEED2 are offered); the responder answers with it.
 static const uint8_t kTmCaps[4] = {0x7F, 0x01, 0x0F, 0x00};
 
+// v1.21: 'turbo loop' - the speeds it walks (1x..10x), and the bytes it sends
+// at each: the real speed-test SysEx, then sixteen more with every kind of edge
+// pattern in them. Anything the MIDI IN smears shows.
+static const uint8_t kLoopCodes[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+static const uint8_t kLoopPattern[32] = {
+    0xF0, 0x00, 0x20, 0x3C, 0x00, 0x00, 0x14, 0x55, 0x55, 0x55, 0x55,
+    0x00, 0x00, 0x00, 0x00, 0xF7,
+    0x2A, 0x33, 0x66, 0x4C, 0x19, 0x0F, 0x70, 0x01,
+    0x7E, 0x5A, 0x69, 0x12, 0x24, 0x48, 0xB0, 0x7F};
+
 class TurboMidi {
  public:
   enum St : uint8_t { OFF, REQUEST, WAIT_CAPS, NEGOTIATE, WAIT_ACK, SWITCH1,
                       FIRST_TEST, WAIT_ECHO, SECOND_TEST, WAIT_RESULT,
                       FINALIZE, SETTLE, LOCKED, REVERT,
                       // v1.20: the responder - the machine leads, we answer
-                      R_WAIT_SET, R_ACK, R_WAIT_TEST, R_WAIT_TEST2 };
+                      R_WAIT_SET, R_ACK, R_WAIT_TEST, R_WAIT_TEST2,
+                      // v1.21: 'turbo loop', the MIDI IN self-test
+                      LOOP };
 
   // txMax is Serial1.availableForWrite() on an idle port - how the negotiator
   // recognises that the software ring has gone empty.
@@ -5103,8 +5137,20 @@ class TurboMidi {
   // negotiator's own bytes may move.
   bool     holdsWire() const {
     return (st_ >= NEGOTIATE && st_ <= SETTLE) || st_ == REVERT ||
-           st_ == R_ACK || st_ == R_WAIT_TEST || st_ == R_WAIT_TEST2;
+           st_ == R_ACK || st_ == R_WAIT_TEST || st_ == R_WAIT_TEST2 || st_ == LOOP;
   }
+  // v1.21: THE SPEED CEILING ('turbo max'). The fastest speed code this
+  // XY6 will use - asked for when it leads, offered when the machine does.
+  // SPEED1 (the test) is the ceiling, SPEED2 (the run) one step below it:
+  // at the default that is exactly 10x / 8x. Lower it when the MIDI IN
+  // cannot receive the top speeds cleanly - 'turbo loop' measures that.
+  uint8_t  maxCode()    const { return maxCode_; }
+  uint8_t  speed1Code() const { return maxCode_; }
+  uint8_t  speed2Code() const { return maxCode_ > 2 ? (uint8_t)(maxCode_ - 1) : maxCode_; }
+  void     setMax(uint8_t code) {
+    if (code >= 2 && code <= TURBO_SPEED1_CODE) maxCode_ = code;
+  }
+  bool     looping() const { return st_ == LOOP; }
   // Whether a handshake the machine starts is answered. On from boot, so a
   // machine with TURBO enabled brings the link up by itself, as with a TM-1;
   // 'turbo off' clears it, 'turbo' sets it again.
@@ -5128,6 +5174,7 @@ class TurboMidi {
       case R_ACK:       return "R ACK";
       case R_WAIT_TEST: return "R WAIT TEST";
       case R_WAIT_TEST2:return "R WAIT TEST2";
+      case LOOP:        return "LOOP TEST";
       default:          return "OFF";
     }
   }
@@ -5151,6 +5198,7 @@ class TurboMidi {
   // when a step at the new speed times out.
   void noteAnyByte(uint8_t b) {
     if (anyRx_ < 0xFFFF) anyRx_++;
+    if (b == 0xF0 && f0N_ < 0xFFFF) f0N_++;          // v1.21: SysEx that STARTED
     if (rawN_ < sizeof raw_) raw_[rawN_++] = b;
   }
   // Bytes whose exact value we can name. At the wrong baud a stream of
@@ -5167,7 +5215,12 @@ class TurboMidi {
   // A complete, correctly-headed turbo message is the strongest liveness
   // evidence there is - noise does not counterfeit six header bytes.
   void noteTurboSeen(uint32_t nowMs) { lastRxMs_ = nowMs;
-                                       if (rxSeen_ < 0xFFFF) rxSeen_++; }
+                                       if (rxSeen_ < 0xFFFF) rxSeen_++;
+                                       if (msgN_ < 0xFFFF) msgN_++; }   // ...and ARRIVED
+
+  // v1.21: 'turbo loop' - every byte received while the self-test runs comes
+  // here instead of the MIDI parsers (see handleMidiByte).
+  void loopByte(uint8_t b) { if (loopRxN_ < sizeof loopRx_) loopRx_[loopRxN_++] = b; }
 
   // ---- what the UI and the console ask for ----------------------------------
   // Start the handshake: 'turbo', or SET > TURBO > ENGAGE.
@@ -5177,8 +5230,20 @@ class TurboMidi {
     if (negotiating()) { tmSerial.println(F("turbo: busy, try again in a moment")); return; }
     if (sweeping_)     { tmSerial.println(F("turbo: sweep running - try again after it")); return; }
     tmSerial.printf("turbo: requesting SPEED1 %s (test) / SPEED2 %s (run)\n",
-                    kTmNames[TURBO_SPEED1_CODE], kTmNames[TURBO_SPEED2_CODE]);
+                    kTmNames[speed1Code()], kTmNames[speed2Code()]);
     enter(REQUEST, nowMs);
+    advance(nowMs);
+  }
+  // v1.21: 'turbo loop'. Patch the XY6's MIDI OUT 1 to its own MIDI IN 1
+  // (machine unplugged): every speed from 1x to 10x in turn, the same bytes
+  // out and back, and what came back intact. It measures the one thing a
+  // handshake cannot tell apart from a machine problem - whether this MIDI IN
+  // can receive the speed at all.
+  void startLoop(uint32_t nowMs) {
+    if (st_ != OFF) { tmSerial.println(F("turbo loop: only from 1X, idle - 'turbo off' first")); return; }
+    tmSerial.println(F("turbo loop: OUT 1 must be patched to IN 1 (machine unplugged)."));
+    loopIdx_ = 0; loopPhase_ = 0; loopBest_ = 0; loopBroken_ = false;
+    enter(LOOP, nowMs);
     advance(nowMs);
   }
   // Back to 1x: 'turbo off', or ENGAGE with SPEED set to 1X.
@@ -5228,8 +5293,8 @@ class TurboMidi {
         if (st_ != WAIT_CAPS) return;
         if (!capsOffer(len, d)) {
           tmSerial.printf("turbo: the machine does not offer %s and %s - staying at 1X.\n"
-                          "       Check its GLOBAL > TURBO setting.\n",
-                          kTmNames[TURBO_SPEED1_CODE], kTmNames[TURBO_SPEED2_CODE]);
+                          "       Check its GLOBAL > TURBO setting, or lower 'turbo max'.\n",
+                          kTmNames[speed1Code()], kTmNames[speed2Code()]);
           fail(nullptr, nowMs);
           return;
         }
@@ -5251,21 +5316,35 @@ class TurboMidi {
         break;
       case TM_CMD_SPEED_RES2:                                       // step 10
         if (st_ != WAIT_RESULT) return;
-        target_ = TURBO_SPEED2_CODE;
+        target_ = speed2Code();
         enter(FINALIZE, nowMs);
         break;
       // ---- the responder (v1.20): the machine leads, we answer -------------
       // The same exchange as above with the roles swapped - what a TM-1 does.
       case TM_CMD_SPEED_REQ:                                        // <- 10
         if (!machineMayLead()) return;
-        if (!sendCmd(TM_CMD_SPEED_ANS, kTmCaps, sizeof kTmCaps)) return;
-        tmSerial.println(F(">> TURBO: the machine asks what we support - answered"));
+        {
+          // What we offer: codes 1..maxCode_, bit (code - 1), 7 bits a byte -
+          // at the default ceiling exactly the 7F 01 0F 00 a machine gives.
+          const uint16_t mask = (uint16_t)((1u << maxCode_) - 1u);
+          const uint8_t caps[4] = {(uint8_t)(mask & 0x7F), (uint8_t)((mask >> 7) & 0x7F),
+                                   (uint8_t)(kTmCaps[2] & mask), (uint8_t)(kTmCaps[3] & (mask >> 7))};
+          if (!sendCmd(TM_CMD_SPEED_ANS, caps, sizeof caps)) return;
+        }
+        tmSerial.printf(">> TURBO: the machine asks what we support - answered up to %s\n",
+                        kTmNames[maxCode_]);
         enter(R_WAIT_SET, nowMs);
         break;
       case TM_CMD_SPEED_SET:                                        // <- 12 s1 s2
         if (st_ != R_WAIT_SET && !machineMayLead()) return;
         if (len < 2 || d[0] < 1 || d[0] > 11 || d[1] < 1 || d[1] > 11) {
           tmSerial.println(F("turbo: the machine's 12 names a speed we do not know - ignored"));
+          if (st_ == R_WAIT_SET) fail(nullptr, nowMs);
+          return;
+        }
+        if (d[0] > maxCode_ || d[1] > maxCode_) {
+          tmSerial.printf("turbo: the machine asks for %s / %s, above 'turbo max' %s -"
+                          " not acknowledged\n", kTmNames[d[0]], kTmNames[d[1]], kTmNames[maxCode_]);
           if (st_ == R_WAIT_SET) fail(nullptr, nowMs);
           return;
         }
@@ -5355,7 +5434,7 @@ class TurboMidi {
         enter(WAIT_CAPS, nowMs);
         return true;
       case NEGOTIATE: {                                             // step 4
-        const uint8_t d[2] = {TURBO_SPEED1_CODE, TURBO_SPEED2_CODE};
+        const uint8_t d[2] = {speed1Code(), speed2Code()};
         if (!sendCmd(TM_CMD_SPEED_SET, d, 2)) { fail("TX queue full", nowMs); return true; }
         enter(WAIT_ACK, nowMs);
         return true;
@@ -5365,11 +5444,8 @@ class TurboMidi {
           if (timedOut(nowMs)) { fail("TX never went idle for SWITCH1", nowMs); return true; }
           return false;
         }
-        switchTo(TURBO_SPEED1_CODE, nowMs);
-        // Sixteen raw 00s, not SysEx: a data byte with no running status is
-        // discarded by the receiver, so these are pure time for its UART to
-        // settle at the new divisor before the test pattern arrives.
-        // (The pad goes out with the test, in step 7 - see sendTest().)
+        switchTo(speed1Code(), nowMs);          // what our 12 asked for
+        // The 16-byte pad goes out with the test, in step 7 - see sendTest().
         enter(FIRST_TEST, nowMs);
         return true;
       }
@@ -5378,6 +5454,8 @@ class TurboMidi {
         if (!sendTest(nowMs)) { fail("TX queue full", nowMs); return true; }
         enter(WAIT_ECHO, nowMs);
         return true;
+      case LOOP:                                    // 'turbo loop'
+        return loopStep(nowMs);
       case R_ACK:                                   // responder: our 13 is out
         if (!txIdle()) {
           if (timedOut(nowMs)) { fail("TX never went idle after our ACK", nowMs); return true; }
@@ -5510,7 +5588,7 @@ class TurboMidi {
     sysex1.reset();
     midiRxReset();                      // running status / SPP from the old speed
     g_txInSysex = false;                // the ring was just emptied
-    anyRx_ = 0; rxSeen_ = 0; rawN_ = 0;
+    anyRx_ = 0; rxSeen_ = 0; rawN_ = 0; f0N_ = 0; msgN_ = 0;
     lastRxMs_ = wdMs_ = nowMs;
     tmSerial.printf(">> TURBO: UART now %lu baud (%s)\n",
                     (unsigned long)kTmSpeeds[code], kTmNames[code]);
@@ -5546,27 +5624,98 @@ class TurboMidi {
     return true;
   }
 
-  // Why a step at the new speed got no reply. The machine's MIDI clock keeps
-  // arriving through a handshake, so what reached us since the switch tells
-  // three failures apart.
+  // Why a step at the new speed got no reply, from what reached us since the
+  // switch. v1.20 judged by "anything parsed", and one keepalive FE - a byte
+  // that survives almost any line - made it blame the machine's timing when
+  // every message was arriving mangled. Now: did SysEx START, and did any
+  // ARRIVE WHOLE?
   void reportLine() const {
     char b[3 * sizeof raw_ + 1]; int k = 0;
     for (uint8_t i = 0; i < rawN_; ++i) k += snprintf(b + k, sizeof b - (size_t)k, " %02X", raw_[i]);
     b[k] = 0;
-    tmSerial.printf("       at %s since the switch: %u bytes in, %u of them parsed"
-                    " (clock, FE).%s%s\n", speedName(), (unsigned)anyRx_, (unsigned)rxSeen_,
-                    rawN_ ? " First bytes:" : "", b);
+    tmSerial.printf("       at %s since the switch: %u bytes in, %u SysEx started, %u arrived"
+                    " whole.%s%s\n", speedName(), (unsigned)anyRx_, (unsigned)f0N_,
+                    (unsigned)msgN_, rawN_ ? " First bytes:" : "", b);
     if (!anyRx_)
       tmSerial.println(F("       NOTHING arrived: the machine sent nothing at this speed, or\n"
-                         "       the XY6's MIDI IN does not pass it at all."));
-    else if (!rxSeen_)
-      tmSerial.println(F("       Bytes arrive but none parse: the two ends are at different\n"
-                         "       speeds - or the MIDI IN optocoupler is too slow for this\n"
-                         "       speed (a 6N138 tops out near 2x; TurboMIDI needs a 6N137\n"
-                         "       or H11L1, as in Elektron's own gear and the TM-1)."));
+                         "       the XY6's MIDI IN does not pass it at all. 'turbo loop' tells."));
+    else if (msgN_)
+      tmSerial.println(F("       Messages arrive whole at this speed, so the wire works: the\n"
+                         "       machine sent something else, or not in time."));
+    else if (f0N_)
+      tmSerial.println(F("       The machine IS talking at this speed, but not one message arrived\n"
+                         "       whole. Bytes with one long low stretch (F0 FE 00) get through\n"
+                         "       and the rest are mangled: the XY6's MIDI IN is smearing the\n"
+                         "       edges - its optocoupler (or pull-up) is too slow for this speed.\n"
+                         "       'turbo loop' measures the fastest speed it passes; 'turbo max'\n"
+                         "       keeps TurboMIDI at or below it."));
     else
-      tmSerial.println(F("       Clock parses at this speed, so the link itself works: the\n"
-                         "       machine did not answer. Its timing, not the wire."));
+      tmSerial.println(F("       Bytes arrive but no SysEx starts: the two ends are at different\n"
+                         "       speeds, or the MIDI IN mangles everything here. 'turbo loop' tells."));
+  }
+
+  // ---- 'turbo loop' ---------------------------------------------------------
+  // One speed per pass through here: switch (once the UART is idle), send the
+  // pattern, collect for 40 ms, judge. Then back to 1x and a verdict.
+  bool loopStep(uint32_t nowMs) {
+    const uint8_t n = (uint8_t)sizeof kLoopCodes;
+    if (loopPhase_ == 0) {
+      if (!txIdle()) {
+        if (!timedOut(nowMs)) return false;
+        loopBroken_ = true;                       // give up, go home
+        loopIdx_ = n;
+      }
+      if (loopIdx_ >= n) { loopDone(nowMs); return true; }
+      switchTo(kLoopCodes[loopIdx_], nowMs);
+      loopRxN_ = 0;
+      // Two halves: a queue message is at most 31 bytes. Back to back in
+      // qTurbo, so on the wire they are one unbroken 32-byte run.
+      if (!qTurbo.push(kLoopPattern, 16) || !qTurbo.push(kLoopPattern + 16, 16)) {
+        loopBroken_ = true;
+        loopDone(nowMs);
+        return true;
+      }
+      loopPhase_ = 1;
+      loopUntilMs_ = nowMs + 40;
+      return true;
+    }
+    if (loopRxN_ < sizeof kLoopPattern && (int32_t)(nowMs - loopUntilMs_) < 0) return false;
+    uint8_t same = 0;
+    for (uint8_t i = 0; i < loopRxN_ && i < sizeof kLoopPattern; ++i) same += (loopRx_[i] == kLoopPattern[i]);
+    const bool ok = (loopRxN_ == sizeof kLoopPattern && same == sizeof kLoopPattern);
+    char got[3 * 12 + 1]; int k = 0;
+    for (uint8_t i = 0; i < loopRxN_ && i < 12; ++i) k += snprintf(got + k, sizeof got - (size_t)k, " %02X", loopRx_[i]);
+    got[k] = 0;
+    const uint8_t code = kLoopCodes[loopIdx_];
+    tmSerial.printf("  %-4s %6lu baud: %2u of %u back intact%s%s\n", kTmNames[code],
+                    (unsigned long)kTmSpeeds[code], (unsigned)same, (unsigned)sizeof kLoopPattern,
+                    ok ? "" : "   got:", ok ? "" : (loopRxN_ ? got : " nothing"));
+    if (ok && loopBest_ == loopIdx_) loopBest_ = (uint8_t)(loopIdx_ + 1);   // unbroken run from 1x
+    loopIdx_++;
+    loopPhase_ = 0;
+    deadline_ = nowMs + TURBO_STEP_TIMEOUT_MS;
+    return true;
+  }
+  void loopDone(uint32_t nowMs) {
+    if (cur_ != 1) switchTo(1, nowMs);
+    st_ = OFF;
+    uiTouch();
+    if (loopBroken_) { tmSerial.println(F("turbo loop: stopped - could not transmit")); return; }
+    if (loopBest_ == 0) {
+      tmSerial.println(F("turbo loop: nothing came back intact even at 1X - is OUT 1 patched\n"
+                         "            to IN 1, with the machine unplugged?"));
+      return;
+    }
+    const uint8_t best = kLoopCodes[loopBest_ - 1];
+    tmSerial.printf("turbo loop: this MIDI IN passes up to %s cleanly.\n", kTmNames[best]);
+    if (best < 2)
+      tmSerial.println(F("            TurboMIDI needs at least 2X - the input stage has to change."));
+    else if (best < TURBO_SPEED1_CODE)
+      tmSerial.printf("            'turbo max %lu' keeps TurboMIDI inside that (tests at %s,\n"
+                      "            runs one step lower); 'save' keeps the setting.\n",
+                      (unsigned long)(kTmSpeeds[best] / 31250u), kTmNames[best]);
+    else
+      tmSerial.println(F("            Full speed is fine: the MIDI IN is not the problem."));
   }
 
   // Bit (code - 1) of the 14-bit mask in the first two data bytes is speed
@@ -5577,7 +5726,7 @@ class TurboMidi {
     const bool same = (len == sizeof kTmCaps && memcmp(d, kTmCaps, len) == 0);
     tmSerial.printf("turbo: machine offers mask %04X%s\n", (unsigned)mask,
                     same ? " (as captured)" : " - differs from the captured 7F 01 0F 00");
-    return ((mask >> (TURBO_SPEED1_CODE - 1)) & 1u) && ((mask >> (TURBO_SPEED2_CODE - 1)) & 1u);
+    return ((mask >> (speed1Code() - 1)) & 1u) && ((mask >> (speed2Code() - 1)) & 1u);
   }
 
   // One turbo message into qTurbo, whole. Bytes 4 and 5 are 00 00 until the
@@ -5665,6 +5814,12 @@ class TurboMidi {
   bool     allow_ = true, refusedLogged_ = false;
   uint8_t  raw_[12];                      // first bytes after a switch
   uint8_t  rawN_ = 0;
+  uint16_t f0N_ = 0, msgN_ = 0;           // v1.21: SysEx started / arrived whole
+  uint8_t  maxCode_ = TURBO_SPEED1_CODE;  // v1.21: 'turbo max'
+  uint8_t  loopIdx_ = 0, loopPhase_ = 0, loopBest_ = 0, loopRxN_ = 0;
+  bool     loopBroken_ = false;
+  uint32_t loopUntilMs_ = 0;
+  uint8_t  loopRx_[40];
 };
 
 static TurboMidi turbo;
@@ -7896,6 +8051,7 @@ struct Store {
                               (uiInvert    ? 0x02u : 0u) |
                               (uiChipStyle ? 0x04u : 0u));
     gGlobal.turboBias = 0;              // v1.19: unused, kept for the layout
+    gGlobal.turboSpeedIdx = turbo.maxCode();   // v1.21: 'turbo max' 
     // v1.17: rsv[0] held v1.16's single style - the dissolve that was picked
     // for everything - so it now means SUB; PAGES is new, in rsv[4].
     gGlobal.rsv[0] = (uint8_t)(uiTransSub + 1);     // 0 = older firmware
@@ -7924,6 +8080,7 @@ struct Store {
     uiApplyContrast();
     if (gGlobal.rsv[0] >= 1 && gGlobal.rsv[0] <= TS_COUNT) uiTransSub   = (uint8_t)(gGlobal.rsv[0] - 1);
     if (gGlobal.rsv[4] >= 1 && gGlobal.rsv[4] <= TS_COUNT) uiTransStyle = (uint8_t)(gGlobal.rsv[4] - 1);
+    turbo.setMax(gGlobal.turboSpeedIdx);     // v1.21: ignores 0 / out of range
     if (gGlobal.rsv[1] & 0x80u) g_joyMask = (uint8_t)(gGlobal.rsv[1] & 0x3Fu);
     if (gGlobal.rsv[2] >= 1 && gGlobal.rsv[2] <= destCount()) g_joyDestX = (uint8_t)(gGlobal.rsv[2] - 1);
     if (gGlobal.rsv[3] >= 1 && gGlobal.rsv[3] <= destCount()) g_joyDestY = (uint8_t)(gGlobal.rsv[3] - 1);
@@ -8190,7 +8347,7 @@ static void setValue(uint8_t id, char* out, uint8_t cap) {
     case SI_MODE:   if (txMode == 3) snprintf(out, cap, "CC");
                     else             snprintf(out, cap, "NRPN%u", txMode);
                     break;
-    case SI_TSPEED: snprintf(out, cap, "%s", kTmNames[kSetTurboIdx[setTurboSel]]); break;
+    case SI_TSPEED: snprintf(out, cap, "%s", setTurboSel ? kTmNames[turbo.speed2Code()] : "1X"); break;
     case SI_TGO:    snprintf(out, cap, "GO"); break;
     case SI_BRIGHT: snprintf(out, cap, "%02X", (unsigned)uiContrast); break;
     case SI_WIDTH:  u8s((uint8_t)UI_W, out); break;
@@ -8946,6 +9103,9 @@ static void handleMidiByte(uint8_t b) {
   }
   // Feeds the turbo link watchdog. See TurboMidi::noteLiveByte for why this is
   // not simply "any status byte".
+  // v1.21: during 'turbo loop' our own bytes are coming back; they are the
+  // measurement, and none of them is MIDI meant for us.
+  if (turbo.looping()) { turbo.loopByte(b); return; }
   turbo.noteAnyByte(b);
   if (b & 0x80) turboNoteLiveByte(b);
   // Realtime bytes may appear anywhere, including inside a SysEx, so they are
@@ -9162,6 +9322,8 @@ static void printHelp() {
     "                 keepalive every 150 ms while it is up\n"
     "  turbo off      back to 31250 baud, and stop answering the machine\n"
     "  turbo ?        link state\n"
+    "  turbo loop     MIDI IN self-test, 1x..10x: patch OUT 1 to IN 1 first\n"
+    "  turbo max <n>  fastest speed to use: 2 3 4 5 6 8 10 (default 10)\n"
     "  turbo v        toggle raw hex logging (ON at boot)\n"
     "  turbo sweep    walk the device-id byte 00..7F looking for ANY answer\n"
     "  turbo f <n>    FORCE 1, 8 or 10x with no handshake (diagnostic)\n"
@@ -9522,6 +9684,22 @@ static void handleCommand(const char* c) {
       return;
     }
     if (!strncmp(arg, "off", 3) || n == 1) { turbo.stop(millis()); return; }
+    if (!strncmp(arg, "loop", 4)) { turbo.startLoop(millis()); return; }     // turbo loop
+    if (!strncmp(arg, "max", 3)) {                                          // turbo max <n>
+      const long m = parseArg(arg, false);
+      uint8_t code = 0;
+      for (uint8_t k = 2; k <= TURBO_SPEED1_CODE; ++k)
+        if ((long)(kTmSpeeds[k] / 31250u) == m) code = k;
+      if (m >= 0 && !code) {
+        Serial.println(F("turbo max takes 2 3 4 5 6 8 10 (the multiplier)"));
+        return;
+      }
+      if (code) turbo.setMax(code);
+      Serial.printf("turbo: ceiling %s - handshakes test at %s and run at %s%s\n",
+                    kTmNames[turbo.maxCode()], kTmNames[turbo.speed1Code()],
+                    kTmNames[turbo.speed2Code()], code ? "; 'save' keeps it" : "");
+      return;
+    }
     if (!strncmp(arg, "sw", 2)) { turbo.startSweep(millis()); return; }      // turbo sweep
     if (arg[0] == 'v') {                       // turbo v = toggle hex logging
       turboVerbose = !turboVerbose;
@@ -9538,9 +9716,10 @@ static void handleCommand(const char* c) {
     if (arg[0] == '?') {
       Serial.printf("turbo: %s at %s (%lu baud)\n", turbo.stateName(),
                     turbo.speedName(), (unsigned long)turbo.baud());
-      Serial.printf("       SPEED1 code %u = %s (test)   SPEED2 code %u = %s (run)\n",
-                    (unsigned)TURBO_SPEED1_CODE, kTmNames[TURBO_SPEED1_CODE],
-                    (unsigned)TURBO_SPEED2_CODE, kTmNames[TURBO_SPEED2_CODE]);
+      Serial.printf("       ceiling %s: SPEED1 code %u = %s (test)   SPEED2 code %u = %s (run)\n",
+                    kTmNames[turbo.maxCode()],
+                    (unsigned)turbo.speed1Code(), kTmNames[turbo.speed1Code()],
+                    (unsigned)turbo.speed2Code(), kTmNames[turbo.speed2Code()]);
       Serial.printf("       answers the machine's own handshake: %s\n",
                     turbo.answersMachine() ? "yes" : "no ('turbo' to allow)");
       Serial.printf("       keepalive %s, %lu FE sent; machine's own keepalive %s\n",
@@ -9555,7 +9734,8 @@ static void handleCommand(const char* c) {
       Serial.printf("       log lines dropped %lu\n", (unsigned long)tmLogDrops);
       return;
     }
-    Serial.println(F("turbo | turbo off | turbo ? | turbo v | turbo sweep | turbo f <1|8|10>"));
+    Serial.println(F("turbo | turbo off | turbo ? | turbo loop | turbo max <n> | turbo v |\n"
+                     "turbo sweep | turbo f <1|8|10>"));
     return;
   }
   if (isCmd(c, "clk")) {

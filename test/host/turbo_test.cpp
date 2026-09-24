@@ -38,6 +38,19 @@ void check(bool ok, const char* what) {
 }
 
 // ---- the machine --------------------------------------------------------------
+// What the XY6's MIDI IN hands its UART for a byte sent at `baud`.
+bool xyDeafGlobal = false; uint32_t xySmearGlobal = 0;
+uint8_t throughXyMidiIn(uint8_t b, uint32_t baud) {
+  if (baud != Serial1.baud()) return 0x00;                  // wrong speed: junk
+  if (xyDeafGlobal && baud > 31250) return 0x00;            // nothing usable at all
+  if (xySmearGlobal && baud > xySmearGlobal) {              // smeared edges
+    uint8_t ones = 0xFF;                                    // ones-then-zeros only
+    for (int k = 0; k <= 8; ++k, ones = (uint8_t)(ones << 1)) if (b == ones) return b;
+    return 0x00;
+  }
+  return b;
+}
+
 struct Peer {
   // How it behaves.
   bool answersCaps = true, acks = true, echoIntact = true, answersTest2 = true;
@@ -46,6 +59,10 @@ struct Peer {
                                        //   (first probe at nextProbe)
   uint32_t lateSwitchUs = 0;           // extra delay before its switch to SPEED1
   bool xyDeaf = false;                 // the XY6's MIDI IN fails above 1x
+  // A MIDI IN whose optocoupler smears edges above this baud: a byte survives
+  // only if it has a single low stretch (F0 FE 00 ...), everything else comes
+  // out mangled - what the real XY6 test board showed at 10x.
+  uint32_t xySmearAbove = 0;
   // Where it is.
   uint32_t baud = 31250;
   bool     turbo = false;              // at SPEED2 with the link up
@@ -115,9 +132,17 @@ struct Peer {
         break;
       }
       // ---- as the leader: our answers ----
-      case 0x11:
-        if (m != M_WAIT_CAPS) break;
-        { const uint8_t sp[2] = {0x08, 0x07}; reply(0x12, sp, 2, t); speed1 = 8; speed2 = 7; }
+      case 0x11: {
+        if (m != M_WAIT_CAPS || n < 2) break;
+        // Like the XY6's own initiator: test at the fastest speed offered, run
+        // one step below it. Our default 7F 01 gives 08 07.
+        const uint16_t mask = (uint16_t)(d[0] | (d[1] << 7));
+        uint8_t top = 0;
+        for (uint8_t c = 1; c <= 11; ++c) if (mask & (1u << (c - 1))) top = c;
+        speed1 = top; speed2 = top > 2 ? (uint8_t)(top - 1) : top;
+        const uint8_t sp[2] = {speed1, speed2};
+        reply(0x12, sp, 2, t);
+      }
         m = M_WAIT_ACK; mDeadline = t + 500000;
         break;
       case 0x13:
@@ -163,6 +188,7 @@ struct Peer {
   }
 
   void tick(uint64_t now) {
+    xyDeafGlobal = xyDeaf; xySmearGlobal = xySmearAbove;
     // Our bytes arriving, and its own UART change, in time order.
     for (;;) {
       const bool haveByte = rd < sim::wire.size() && sim::wire[rd].doneUs <= now;
@@ -200,8 +226,7 @@ struct Peer {
     }
     // Delivered to the XY6: intact at a matching speed, junk otherwise.
     while (!out.empty() && out.front().us <= now) {
-      const bool heard = out.front().baud == Serial1.baud() && !(xyDeaf && Serial1.baud() > 31250);
-      Serial1.inject(heard ? out.front().b : 0x00);
+      Serial1.inject(throughXyMidiIn(out.front().b, out.front().baud));
       out.pop_front();
     }
   }
@@ -211,11 +236,21 @@ Peer peer;
 bool load = true;          // pattern + LFOs + stick running throughout
 bool sysexStress = false;  // our own SysEx on the wire, some of it in pieces
 bool displayStorm = false; // a full 8 KB panel push after every loop pass
+bool loopback = false;     // OUT 1 patched to IN 1, no machine at all
+size_t loopRd = 0;
 
 // One loop pass: the peer, the stick, the sketch, then 20 us of other work.
 void pass() {
   const uint64_t now = sim::nowUs();
-  peer.tick(now);
+  if (loopback) {
+    xyDeafGlobal = peer.xyDeaf; xySmearGlobal = peer.xySmearAbove;
+    while (loopRd < sim::wire.size() && sim::wire[loopRd].doneUs <= now) {
+      const sim::WireByte& w = sim::wire[loopRd++];
+      Serial1.inject(throughXyMidiIn(w.b, w.baud));
+    }
+  } else {
+    peer.tick(now);
+  }
   if (load) {
     const double ts = (double)now * 1e-6;
     sim::adc[JOY_PIN_X] = (uint16_t)(512 + 330 * sin(2 * M_PI * 1.5 * ts));
@@ -593,8 +628,76 @@ void scenarioDeaf() {
   check(!turbo.negotiating() && turbo.baud() == 31250, "falls back to 1X");
   const std::string log = Serial.captured.substr(logFrom);
   check(log.find("at 10X since the switch") != std::string::npos &&
-        log.find("none parse") != std::string::npos,
-        "the report says bytes arrived at 10X and none parsed");
+        log.find("no SysEx starts") != std::string::npos,
+        "the report says bytes arrived at 10X with no SysEx in them");
+  common();
+}
+
+// v1.21: the real test board. The machine leads and gets to 10x; our MIDI IN
+// passes F0 FE 00 but mangles every edge-dense byte. The report must say the
+// machine IS talking and nothing arrives whole - not blame its timing.
+void scenarioGarbled() {
+  peer.leads = true;
+  peer.xySmearAbove = 31250;
+  boot();
+  const size_t logFrom = Serial.captured.size();
+  peer.nextProbe = sim::nowUs() + 100000;
+  run(1500);
+  check(!turbo.locked() && !turbo.negotiating() && turbo.baud() == 31250, "no link, back at 1X");
+  const std::string log = Serial.captured.substr(logFrom);
+  check(log.find("at 10X since the switch") != std::string::npos &&
+        log.find("0 arrived whole") != std::string::npos &&
+        log.find("IS talking at this speed") != std::string::npos,
+        "the report says the machine is talking at 10X and nothing arrives whole");
+  check(log.find("did not answer") == std::string::npos, "and does not blame the machine");
+  common();
+}
+
+// v1.21: the same MIDI IN, clean up to 4x. 'turbo max 4' has to bring the link
+// up - whichever end leads.
+void scenarioCeiling() {
+  peer.xySmearAbove = 125000;
+  boot();
+  handleCommand("turbo max 4");
+  check(turbo.speed1Code() == 4 && turbo.speed2Code() == 3, "ceiling 4X: test 4X, run 3.3X");
+  const size_t mark = sim::wire.size();
+  handleCommand("turbo");
+  check(runUntil(1000, [] { return turbo.locked(); }), "XY6 leading: locks under the ceiling");
+  const std::vector<TmMsg> m = turboSentSince(mark);
+  check(m.size() >= 2 && m[1].cmd == 0x12 && m[1].d == std::vector<uint8_t>({0x04, 0x03}),
+        "asks 12 04 03");
+  check(turbo.baud() == 104062 && peer.baud == 104062, "both at 3.3X");
+  handleCommand("turbo off");
+  run(TURBO_REVERT_HOLD_MS + 600);
+  // Now the machine leads, and has to pick from what we offer.
+  handleCommand("turbo max 4");                      // (the ceiling survives 'turbo off')
+  turbo.start(millis()); turbo.stop(millis());       // answering on again, via 'turbo'...
+  handleCommand("turbo");                            // ...and our own attempt racing it
+  peer.leads = true; peer.nextProbe = sim::nowUs();
+  check(runUntil(2000, [] { return turbo.locked(); }), "machine leading: locks under the ceiling");
+  check(turbo.baud() <= 125000 && peer.baud == turbo.baud(), "at or below 4X, both ends");
+  common();
+}
+
+// v1.21: 'turbo loop' with OUT 1 patched to IN 1 and a MIDI IN clean to 8x.
+void scenarioLoop() {
+  loopback = true;
+  peer.clock = false;
+  peer.xySmearAbove = 250000;
+  boot();
+  loopRd = sim::wire.size();
+  const size_t logFrom = Serial.captured.size();
+  handleCommand("turbo loop");
+  check(runUntil(2000, [] { return !turbo.looping(); }), "the self-test finishes");
+  run(100);
+  const std::string log = Serial.captured.substr(logFrom);
+  if (getenv("XY6_ECHO")) printf("%s\n", log.c_str());
+  check(log.find("8X   250000 baud: 32 of 32 back intact") != std::string::npos, "8X passes");
+  check(log.find("10X  312500 baud: 32 of 32") == std::string::npos &&
+        log.find("10X  312500 baud:") != std::string::npos, "10X fails");
+  check(log.find("passes up to 8X cleanly") != std::string::npos &&
+        log.find("'turbo max 8'") != std::string::npos, "the verdict: up to 8X, 'turbo max 8'");
+  check(!turbo.negotiating() && turbo.baud() == 31250, "back at 1X afterwards");
   common();
 }
 
@@ -606,6 +709,8 @@ const Scenario kScenarios[] = {
   {"machine", scenarioMachineLeads}, {"busy", scenarioMachineBusy},
   {"refused", scenarioRefused},
   {"latepeer", scenarioLatePeer},    {"deaf", scenarioDeaf},
+  {"garbled", scenarioGarbled},      {"ceiling", scenarioCeiling},
+  {"loop", scenarioLoop},
 };
 
 }  // namespace
