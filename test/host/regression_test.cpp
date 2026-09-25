@@ -1,4 +1,4 @@
-// One check per bug fixed in v1.18 (and the v1.22 preset load), plus the turbo speed change under load
+// One check per bug fixed in v1.18 (and the v1.23 preset load), plus the turbo speed change under load
 // (the TX path it depends on changed). Runs the real sketch against ./mock.
 // Exit code 0 when every check passes. Build and run: ./run.sh
 #ifndef SKETCH
@@ -169,7 +169,7 @@ int main() {
     check(!Store::busy() && strcmp(storeMsg, "SAVED") == 0, "store: the first save completes");
   }
 
-  // ---- 6. v1.22: a saved preset loads. The CRC covered its own field, so
+  // ---- 6. v1.23: a saved preset loads. The CRC covered its own field, so
   // every load said CRC FAIL; a torn record must still be refused.
   {
     lfo.p[2].spd = 77;
