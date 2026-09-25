@@ -1,4 +1,4 @@
-// One check per bug fixed in v1.18, plus the turbo speed change under load
+// One check per bug fixed in v1.18 (and the v1.22 preset load), plus the turbo speed change under load
 // (the TX path it depends on changed). Runs the real sketch against ./mock.
 // Exit code 0 when every check passes. Build and run: ./run.sh
 #ifndef SKETCH
@@ -167,6 +167,19 @@ int main() {
     check(strcmp(storeMsg, "NO EEPROM") != 0, "store: ...without claiming there is no EEPROM");
     for (int k = 0; k < 200 && Store::busy(); ++k) run(10);
     check(!Store::busy() && strcmp(storeMsg, "SAVED") == 0, "store: the first save completes");
+  }
+
+  // ---- 6. v1.22: a saved preset loads. The CRC covered its own field, so
+  // every load said CRC FAIL; a torn record must still be refused.
+  {
+    lfo.p[2].spd = 77;
+    Store::packInto(0);                                // exactly what SAVE writes
+    lfo.p[2].spd = 20;
+    check(Store::unpackFrom() && lfo.p[2].spd == 77, "store: a saved preset loads back");
+    Store::packInto(0);
+    gRec.lfo[2].spd ^= 1;                              // one byte torn
+    check(!Store::unpackFrom() && strcmp(storeMsg, "CRC FAIL") == 0,
+          "store: a torn preset is still refused");
   }
 
   printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);

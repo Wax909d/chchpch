@@ -3,6 +3,31 @@
 // =============================================================================
 //
 // -----------------------------------------------------------------------------
+// WHAT CHANGED IN v1.22 - THE MONOMACHINE'S OWN NAMES AND VALUES; PRESETS LOAD
+// -----------------------------------------------------------------------------
+// Redot's survey of a real Monomachine - every machine, page and parameter,
+// with its range, init-kit default and value list - is mnm_params.h, next to
+// this file (the Arduino IDE opens it as a second tab; keep them together).
+//  * 'mach', 'mach <t> <m>': the machine on each track, from the console (the
+//    wizard's page needs encoders). The 22 real machines replace the old
+//    placeholder list; presets saved before are translated on load.
+//  * The SYNT page is named per machine wherever a destination is shown: LFO
+//    pages, PERF, pattern locks, the console. SYNT slot 4 on a SID is WAVE.
+//  * The LFO EDIT scope prints the value as the machine shows it - PAN -12,
+//    SID WAVE PULS, FM+DYN 1FRQ 1.0 - not the raw byte.
+//  * 'kit watch': each CC the machine sends, named and formatted, raw value
+//    alongside - which settles the map's one open question (is a list value
+//    an index or spread over 0-127?). 'kit', 'kit <t>': every parameter of
+//    every track as the machine last sent it, '?' where it has not.
+//  * EFFX slots 7-8 are DBAS and DWID, as on the machine (were DFBS, DFWD).
+//  * FIX: LOAD never worked - every preset said CRC FAIL. The CRC's range
+//    begins on the crc field itself and SAVE computes it with that field at
+//    0; LOAD checked with the stored value in place. Now checked the way it
+//    was computed, so presets saved by earlier versions load too.
+//  Not yet: decoding a SysEx kit dump. That waits on real dumps to check the
+//  byte layout against ('dumpraw' captures one).
+//
+// -----------------------------------------------------------------------------
 // WHAT CHANGED IN v1.21 - WHY 10X FAILS ON THE TEST BOARD, AND WHAT TO DO ABOUT IT
 // -----------------------------------------------------------------------------
 // v1.20 on the real Monomachine: the machine led, we answered, both ends went
@@ -635,6 +660,7 @@
 #include <string.h>
 #include <math.h>          // sqrtf, used by the boot animation
 #include <stdarg.h>        // vsnprintf, used by the deferred turbo log
+#include "mnm_params.h"    // v1.22: every Monomachine parameter, from the survey
 
 // Forward declarations for functions defined further down. Only primitives in
 // the signatures, so the Arduino IDE's prototype-hoist quirk cannot bite us:
@@ -652,6 +678,7 @@ static bool sceneApply();
 static void scenePrintSheet();
 static uint8_t mnmCC(uint8_t page, uint8_t slot);
 static const char* mnmParamName(uint8_t page, uint8_t slot);
+static const char* trackParamName(uint8_t track, uint8_t page, uint8_t slot);
 static void patPrintHelp();
 static void pumpMidi();
 static void midiTxService();
@@ -994,7 +1021,7 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define PERF_FULL_FADERS   1
 
 // Shown on the boot screen and by the console. One place, so it cannot drift.
-#define XY6_VERSION              "1.21"
+#define XY6_VERSION              "1.22"
 
 // ---- Joystick (A0 / A1) -----------------------------------------------------
 // v1.17: the stick sends X and Y to every track picked on the JOY page (PERF
@@ -1569,12 +1596,25 @@ enum StepProb : uint8_t {
 };
 static const uint8_t kStepProbPct[PROB_COUNT] = {0, 10, 20, 33, 50, 66, 75, 90, 100};
 
-// Machine names for the wizard's machine-select page. A real build fills these
-// from the kit dump; the wizard needs a list to show before any dump arrives.
-static const char* const kMachineName[] = {
-  "----", "SID6581", "SIDLEAD", "SIDBASS", "FMSTATIC", "FMPARAL", "FMDYNAM",
-  "DIGIPRO", "SUPERWAV", "VO6", "GNDSIN", "GNDNOIS", "BBOX"};
-static const uint8_t MACHINE_COUNT = sizeof(kMachineName) / sizeof(kMachineName[0]);
+// The machine on each track, as an id into mnm_params.h: 0 = not chosen,
+// 1..22 = kMnmMachines[id - 1]. Set by the wizard's machine-select page or
+// the 'mach' command, kept in presets. It is what names the SYNT page.
+static const uint8_t MACHINE_COUNT = (uint8_t)(MNM_MACHINE_COUNT + 1);
+static uint8_t machineSel[6] = {0, 0, 0, 0, 0, 0};
+
+// Presets saved before v1.22 numbered machines by a placeholder list:
+//   ----, SID6581, SIDLEAD, SIDBASS, FMSTATIC, FMPARAL, FMDYNAM, DIGIPRO,
+//   SUPERWAV, VO6, GNDSIN, GNDNOIS, BBOX
+// SIDLEAD and SIDBASS are not Monomachine machines; both become the SID.
+static uint8_t machineFromV121(uint8_t old) {
+  static const char* const kOld[13][2] = {
+    {"", ""},         {"SID", "6581"},  {"SID", "6581"},   {"SID", "6581"},
+    {"FM+", "STAT"},  {"FM+", "PAR"},   {"FM+", "DYN"},    {"DPRO", "WAVE"},
+    {"SWAVE", "SAW"}, {"VO-6", "VO6"},  {"GND", "SIN"},    {"GND", "NOIS"},
+    {"DPRO", "BBOX"}};
+  if (old == 0 || old >= 13) return 0;
+  return mnmFindMachine(kOld[old][0], kOld[old][1]);
+}
 
 // =============================== 5x7 font ====================================
 // REDOT SQUARED 5x7 - derived from kFont35 below, not from a stock ASCII set.
@@ -2966,7 +3006,7 @@ static void patPrintGrid() {
     for (uint8_t i = 0; i < patLockN; ++i) {
       const PatLock& L = patLocks[i];
       if ((i % 5) == 0) { usbWait(96); Serial.print("\n  "); }
-      Serial.printf("T%u@%-2u %s=%-3u  ", L.t + 1, L.k + 1, mnmParamName(L.page, L.slot), L.val);
+      Serial.printf("T%u@%-2u %s=%-3u  ", L.t + 1, L.k + 1, trackParamName(L.t, L.page, L.slot), L.val);
     }
     Serial.println();
   }
@@ -3470,7 +3510,7 @@ static const char* const kAmpN[8] = {"ATCK","HOLD","DEC","REL",
 static const char* const kFiltN[8]= {"BASE","WDTH","HPQ","LPQ",
                                      "ATCK","DEC","BOFS","WOFS"};
 static const char* const kEffxN[8]= {"EQF","EQG","SRR","DTIM",
-                                     "DSND","DFB","DFBS","DFWD"};
+                                     "DSND","DFB","DBAS","DWID"};
 static const char* const kLfoN[8] = {"PAGE","DEST","TRIG","WAVE","MULT","SPD",
                                      "INTL","DPTH"};
 static const char* const kMidiN[8]= {"MID1","MID2","MID3","MID4","MID5","MID6",
@@ -3558,13 +3598,86 @@ static const char* mnmParamName(uint8_t page, uint8_t slot) {
   return kMnmPages[page].params[slot];
 }
 
-// Machine profiles put real parameter names on the synth page.
-struct MachineProfile { const char* machineName; const char* const* synthParams; };
-static const char* const kSid6581P[8] =
-    {"TUNE","WAVE","PW","DEC","RES","CUT","LFO","ENV"};
-static const MachineProfile kSid6581 = {"SID6581", kSid6581P};
-static const MachineProfile* gMachine[6] = {nullptr,nullptr,nullptr,
-                                            nullptr,nullptr,nullptr};
+// -----------------------------------------------------------------------------
+// v1.22: REAL NAMES AND VALUES, FROM THE SURVEY (mnm_params.h)
+// -----------------------------------------------------------------------------
+// The page tables above name every slot the same on every track. The SYNT
+// page's eight depend on the machine, and a value means something different
+// per slot: PAN 64 is centre, SID WAVE 2 is PULS. These look a slot up in the
+// survey, per track. nullptr = the survey does not describe it (SYNT on a
+// track with no machine chosen, LEVL, the pages with no CC).
+static const MnmParam* mnmParamFor(uint8_t track, uint8_t page, uint8_t slot) {
+  if (slot >= 8) return nullptr;
+  switch (page) {
+    case PAGE_SYNT: {
+      const MnmMachine* m = mnmMachine(track < 6 ? machineSel[track] : (uint8_t)0);
+      return m ? &m->p[slot] : nullptr;
+    }
+    case PAGE_AMP:  return &kMnmAmpP[slot];
+    case PAGE_FILT: return &kMnmFiltP[slot];
+    case PAGE_EFFX: return &kMnmEffxP[slot];
+    case PAGE_LFO1: case PAGE_LFO2: case PAGE_LFO3: return &kMnmLfoP[slot];
+    default: return nullptr;
+  }
+}
+
+// The slot's name on this track: the machine's own for SYNT ("-" for a slot
+// the machine leaves unused), the page table's otherwise.
+static const char* trackParamName(uint8_t track, uint8_t page, uint8_t slot) {
+  if (page == PAGE_SYNT) {
+    const MnmParam* p = mnmParamFor(track, page, slot);
+    if (p) return p->name;
+  }
+  return mnmParamName(page, slot);
+}
+
+// CC -> (page, slot). The inverse of mnmCC(); false for a CC no page uses.
+static bool mnmPageOfCc(uint8_t cc, uint8_t* page, uint8_t* slot) {
+  for (uint8_t p = 0; p < PAGE_COUNT; ++p) {
+    const uint8_t first = kMnmPages[p].cc;
+    if (first == 0xFF || cc < first || cc >= first + kMnmPages[p].count) continue;
+    *page = p; *slot = (uint8_t)(cc - first);
+    return true;
+  }
+  return false;
+}
+
+// What the Monomachine has told us each track holds, by CC: every knob turned
+// on the machine sends one on that track's channel. 0xFF = not heard yet.
+// Filled from the MIDI IN parser whatever the TX mode, echoes included - an
+// echo of what we sent is still what the machine now holds.
+static uint8_t g_kitCc[6][128];
+
+// Monomachine LFO DEST: what it points at depends on the same LFO's PAGE.
+// nullptr when that PAGE has not been heard, or it is SYNT with no machine.
+static const char* kitLfoDestName(uint8_t track, uint8_t lfoPageRaw, uint8_t d) {
+  if (lfoPageRaw > 127 || d >= 8 || track >= 6) return nullptr;
+  switch (mnmListIndex(lfoPageRaw, kMnmLists[ML_LFOPAGE].n)) {
+    case 0: return kMnmPtchDest[d];
+    case 1: { const MnmMachine* m = mnmMachine(machineSel[track]);
+              return m ? m->p[d].name : nullptr; }
+    case 2: return kMnmAmpP[d].name;
+    case 3: return kMnmFiltP[d].name;
+    case 4: return kMnmEffxP[d].name;
+    case 8: return kMnmMidiDest[d];
+    default: return kMnmLfoP[d].name;               // LFO1..LFO3
+  }
+}
+
+// A value as the machine displays it, at most 5 characters (out >= 6 bytes).
+// A slot the survey does not describe prints as the plain number.
+static void kitFormat(uint8_t track, uint8_t page, uint8_t slot, uint8_t raw, char* out) {
+  static const MnmParam kPlain = {"", MNK_U7, 0, 0};
+  const MnmParam* p = mnmParamFor(track, page, slot);
+  if (!p || p->kind == MNK_NONE) { mnmFormat(kPlain, raw, out); return; }
+  if (p->kind == MNK_LIST && p->arg == ML_LFODEST && track < 6) {
+    const uint8_t pageCc = mnmCC(page, 0);           // this LFO's PAGE slot
+    const char* nm = kitLfoDestName(track, g_kitCc[track][pageCc & 0x7F],
+                                    mnmListIndex(raw, 8));
+    if (nm) { strncpy(out, nm, 5); out[5] = 0; return; }
+  }
+  mnmFormat(*p, raw, out);
+}
 
 // =============================== LFO engine ==================================
 //
@@ -6010,16 +6123,9 @@ static void clipN(const char* s, char* o, uint8_t n) {
 // sketch-defined type in its signature — these take an LFO index and look the
 // structs up from the globals instead.
 static const char* destName(uint8_t i) {
-  const uint8_t page = lfo.p[i].page, dest = lfo.p[i].dest, track = lfo.p[i].track;
-  // The accessor is where the bound has to be enforced. track is 0..5 by every
-  // path that writes it today, but a preset load is a path that did not exist
-  // when this was written, and an out-of-range index here is a wild pointer
-  // dereferenced once per frame.
-  const uint8_t nMach = (uint8_t)(sizeof(gMachine) / sizeof(gMachine[0]));
-  if (page == PAGE_SYNT && track < nMach && gMachine[track] &&
-      gMachine[track]->synthParams && dest < 8)
-    return gMachine[track]->synthParams[dest];
-  return mnmParamName(page, dest);
+  // track is bounds-checked inside mnmParamFor(): a preset load is a path that
+  // can hand us anything, and this is read once per frame.
+  return trackParamName(lfo.p[i].track, lfo.p[i].page, lfo.p[i].dest);
 }
 
 // An 8x5 thumbnail of the shape, drawn as a connected trace rather than eight
@@ -6694,10 +6800,9 @@ static void drawEdit(uint32_t absStep16, bool running) {
 
   // Track and machine on one line - an unknown machine says so rather than
   // lying about a profile we do not have.
-  { const MachineProfile* m = gMachine[p.track < 6 ? p.track : 0];
-    uint8_t k = 0;
+  { uint8_t k = 0;
     b[k++] = 'T'; b[k++] = (char)('1' + p.track); b[k++] = ' ';
-    const char* src = m ? m->machineName : "----";
+    const char* src = mnmMachineLabel(p.track < 6 ? machineSel[p.track] : (uint8_t)0);
     while (*src && k < 15) b[k++] = *src++;
     b[k] = 0;
     gfx.text35(0, 11, b, SH_MID); }
@@ -6757,8 +6862,9 @@ static void drawEdit(uint32_t absStep16, bool running) {
   const int16_t boxY = 172, boxH = 46;
   drawWaveBox(0, boxY, W, boxH, ui.sel, lfo.driving(ui.sel),
               p.enabled ? SH_ON : SH_DIM);
-  { u8s3(p.enabled ? s.value : lfo.restValue(ui.sel), v);
-    textRightKnock((int16_t)(W - 2), (int16_t)(boxY + 2), v, SH_ON); }
+  // v1.22: as the machine shows it - PAN -12, SID WAVE PULS - not the raw byte.
+  kitFormat(p.track, p.page, p.dest, p.enabled ? s.value : lfo.restValue(ui.sel), v);
+  textRightKnock((int16_t)(W - 2), (int16_t)(boxY + 2), v, SH_ON);
 
   // Reachable range, under the box rather than floating over its corners where
   // the trace crosses it.
@@ -6989,7 +7095,7 @@ static void perfValStr(uint8_t i, char* out) {
   else { out[0] = '-'; out[1] = '-'; out[2] = 0; }
 }
 static void perfLabel(uint8_t i, char* out3) {   // out3 needs 4 bytes
-  clipN(mnmParamName(perfSlot[i].page, perfSlot[i].dest), out3, 3);
+  clipN(trackParamName(perfSlot[i].track, perfSlot[i].page, perfSlot[i].dest), out3, 3);
 }
 static uint8_t perfCursor = 0;     // which slot the last turn touched
 // The value last transmitted for each slot. An incoming CC carrying exactly
@@ -7564,7 +7670,7 @@ static void drawPerfDest(uint32_t step16, bool running, uint32_t bpmX100) {
     { char nb[3] = {(char)('1' + i), 0, 0};
       stChip(4, y, 8, nb, true); }
     { uint8_t k = 0;
-      const char* pn = mnmParamName(p.page, p.dest);
+      const char* pn = trackParamName(p.track, p.page, p.dest);
       while (*pn && k < 6) b[k++] = *pn++;
       b[k] = 0;
       stChipAuto(14, y, b, true); }
@@ -7785,7 +7891,6 @@ static void btnPerfSub(uint8_t pressed) {
 
 static PresetP   gRec;                 // one record buffer, packed/unpacked here
 static GlobalCfgP gGlobal;
-static uint8_t   machineSel[6] = {0, 0, 0, 0, 0, 0};   // wizard's per-track choice
 static uint32_t  sxMsgBytes = 0;
 static bool      sxGotDump  = false;
 
@@ -7852,7 +7957,8 @@ struct Store {
     for (uint8_t t = 0; t < EE_TRACKS; ++t) {
       gRec.kit[t].machineId = machineSel[t];
       gRec.kit[t].level     = 100;
-      gRec.kit[t].flags     = sxGotDump ? 1 : 0;
+      // b1 (v1.22): machineId is an mnm_params.h id, not the old placeholder
+      gRec.kit[t].flags     = (uint8_t)((sxGotDump ? 1 : 0) | 2);
     }
     for (uint8_t i = 0; i < 6; ++i) {
       gRec.enc[i].page  = perfSlot[i].page;
@@ -7888,8 +7994,10 @@ struct Store {
                              (sp.slide ? 4 : 0) | (sp.ghost ? 8 : 0) |
                              ((sp.cond & 0x0F) << 4));
       }
-    // CRC last, over everything after the crc field - so a torn write fails
-    // verification rather than loading as a plausible preset.
+    // CRC last - so a torn write fails verification rather than loading as a
+    // plausible preset. NOTE offset 12 is the crc field itself (magic 4,
+    // version 2, size 2, saveCount 4), so the range covers the field, which
+    // is still 0 here. unpackFrom() zeroes it again to check.
     gRec.hdr.crc = xy6Crc16((const uint8_t*)&gRec + 12, gRec.hdr.size);
   }
 
@@ -7899,11 +8007,23 @@ struct Store {
     // v1.15: EXACT, not "at most". A smaller size meant a smaller CRC and the
     // rest of the record loaded without ever being verified.
     if (gRec.hdr.size != sizeof(PresetP) - 12) { strcpy(storeMsg, "BAD SIZE");   return false; }
-    if (xy6Crc16((const uint8_t*)&gRec + 12, gRec.hdr.size) != gRec.hdr.crc) {
-      strcpy(storeMsg, "CRC FAIL"); return false; }
+    // v1.22 FIX: every LOAD said CRC FAIL. The range starts at offset 12,
+    // which is the crc field itself (the "after the crc field" it was meant
+    // to be forgot saveCount), and packInto() computes it while that field is
+    // still 0. Checked with the stored CRC in place it could never match.
+    // Checked the way it was computed, every preset ever saved loads - no
+    // format change, nothing to re-save.
+    { const uint16_t want = gRec.hdr.crc;
+      gRec.hdr.crc = 0;
+      const uint16_t got = xy6Crc16((const uint8_t*)&gRec + 12, gRec.hdr.size);
+      gRec.hdr.crc = want;
+      if (got != want) { strcpy(storeMsg, "CRC FAIL"); return false; } }
 
-    for (uint8_t t = 0; t < EE_TRACKS; ++t)
-      machineSel[t] = (uint8_t)(gRec.kit[t].machineId % MACHINE_COUNT);
+    for (uint8_t t = 0; t < EE_TRACKS; ++t) {
+      const uint8_t id = gRec.kit[t].machineId;
+      machineSel[t] = (gRec.kit[t].flags & 2) ? (id < MACHINE_COUNT ? id : (uint8_t)0)
+                                              : machineFromV121(id);
+    }
     for (uint8_t i = 0; i < 6; ++i) {
       // Every field is range-checked on the way IN. A stale or corrupted byte
       // that survives the CRC must not become an out-of-bounds index into
@@ -8174,7 +8294,7 @@ static void drawWizard(uint32_t nowMs) {
         const bool cur = (wizCursor == t);
         char lb[4] = {'T', (char)('1' + t), 0, 0};
         stChip(0, y, 13, lb, cur);
-        stChip(15, y, (int16_t)(W - 15), kMachineName[machineSel[t]], cur);
+        stChip(15, y, (int16_t)(W - 15), mnmMachineLabel(machineSel[t]), cur);
       }
       stFooter("CLICK", "NEXT");
       break;
@@ -8994,6 +9114,154 @@ static void printDump() {
   Serial.println("===== end - copy everything above and send it =====\n");
 }
 
+// ---- v1.22: 'kit' / 'kit watch' ---------------------------------------------
+// Every CC the Monomachine sends on a track channel lands in g_kitCc. With
+// 'kit watch' on, each is also queued here and printed from loop() with its
+// name and value - the parser runs inside the display flush, where printing
+// stalls the panel (see printDump above).
+struct KitEvt { uint8_t track, cc, val; };
+static const uint8_t KIT_LOG_N = 64;
+static KitEvt   g_kitLog[KIT_LOG_N];
+static uint8_t  g_kitLogHead = 0, g_kitLogTail = 0;
+static uint16_t g_kitLogLost = 0;
+static bool     g_kitWatch = false;
+
+static void kitNoteCc(uint8_t ch, uint8_t cc, uint8_t val) {
+  const uint8_t t = (uint8_t)((ch - (txChannel - 1)) & 0x0F);
+  if (t >= 6) return;                              // not one of the six tracks
+  g_kitCc[t][cc & 0x7F] = (uint8_t)(val & 0x7F);
+  if (!g_kitWatch) return;
+  const uint8_t next = (uint8_t)((g_kitLogHead + 1) % KIT_LOG_N);
+  if (next == g_kitLogTail) { g_kitLogLost++; return; }
+  g_kitLog[g_kitLogHead].track = t;
+  g_kitLog[g_kitLogHead].cc = cc;
+  g_kitLog[g_kitLogHead].val = val;
+  g_kitLogHead = next;
+}
+
+// One line per CC:  T1 SID-6581 SYNT WAVE  CC 51  raw   2 = PULS
+static void kitPrintEvt(uint8_t t, uint8_t cc, uint8_t val) {
+  uint8_t pg = 0, sl = 0;
+  if (!mnmPageOfCc(cc, &pg, &sl)) {
+    Serial.printf("T%u %-8s ---- ----  CC %-3u raw %3u\n", t + 1,
+                  mnmMachineLabel(machineSel[t]), cc, val);
+    return;
+  }
+  char v[6];
+  kitFormat(t, pg, sl, val, v);
+  Serial.printf("T%u %-8s %-4s %-4s  CC %-3u raw %3u = %s\n", t + 1,
+                mnmMachineLabel(machineSel[t]), kMnmPages[pg].name,
+                trackParamName(t, pg, sl), cc, val, v);
+}
+
+static void kitLogService() {
+  while (g_kitLogTail != g_kitLogHead && usbReady(80)) {
+    const KitEvt e = g_kitLog[g_kitLogTail];
+    g_kitLogTail = (uint8_t)((g_kitLogTail + 1) % KIT_LOG_N);
+    kitPrintEvt(e.track, e.cc, e.val);
+  }
+  if (g_kitLogLost && usbReady(48)) {
+    Serial.printf("(kit watch: %u lines dropped - USB too slow)\n", g_kitLogLost);
+    g_kitLogLost = 0;
+  }
+}
+
+// One track's sheet: every page, every slot, name and value. '?' = the
+// machine has not sent that one yet.
+static void kitPrintTrack(uint8_t t) {
+  static const uint8_t kPages[] = {PAGE_SYNT, PAGE_AMP, PAGE_FILT, PAGE_EFFX,
+                                   PAGE_LFO1, PAGE_LFO2, PAGE_LFO3, PAGE_LEVL};
+  usbWait(96);
+  Serial.printf("T%u  %s  (MIDI ch %u)\n", t + 1, mnmMachineLabel(machineSel[t]),
+                (unsigned)(((txChannel - 1 + t) & 0x0F) + 1));
+  for (uint8_t k = 0; k < sizeof(kPages); ++k) {
+    const uint8_t pg = kPages[k];
+    usbWait(128);
+    Serial.printf("  %-4s", kMnmPages[pg].name);
+    for (uint8_t sl = 0; sl < kMnmPages[pg].count; ++sl) {
+      const uint8_t raw = g_kitCc[t][mnmCC(pg, sl) & 0x7F];
+      char v[6];
+      if (raw > 127) { v[0] = '?'; v[1] = 0; }
+      else kitFormat(t, pg, sl, raw, v);
+      Serial.printf(" %4s %-5s", trackParamName(t, pg, sl), v);
+    }
+    Serial.println();
+  }
+}
+
+// ---- v1.22: 'mach' ----------------------------------------------------------
+// Same word, any case, '-' '+' and spaces ignored: "fmdyn" is "FM+DYN".
+static bool machWordEq(const char* a, const char* b) {
+  for (;;) {
+    while (*a == '-' || *a == '+' || *a == ' ') a++;
+    while (*b == '-' || *b == '+' || *b == ' ') b++;
+    char x = *a, y = *b;
+    if (x >= 'a' && x <= 'z') x = (char)(x - 32);
+    if (y >= 'a' && y <= 'z') y = (char)(y - 32);
+    if (x != y) return false;
+    if (!x) return true;
+    a++; b++;
+  }
+}
+
+// "sid", "SID-6581", "6581", "fm+dyn", "dyn", "4" -> machine id. "0" or
+// "none" -> 0. 0xFF when nothing matches.
+static uint8_t machParse(const char* w) {
+  if (w[0] >= '0' && w[0] <= '9') {
+    uint16_t v = 0;
+    while (*w >= '0' && *w <= '9' && v < 1000) v = (uint16_t)(v * 10 + (*w++ - '0'));
+    return v < MACHINE_COUNT ? (uint8_t)v : (uint8_t)0xFF;
+  }
+  if (machWordEq(w, "none")) return 0;
+  for (uint8_t i = 1; i < MACHINE_COUNT; ++i)
+    if (machWordEq(w, kMnmMachines[i - 1].label) || machWordEq(w, kMnmMachines[i - 1].name))
+      return i;
+  uint8_t hit = 0xFF, n = 0;                      // a family with one machine
+  for (uint8_t i = 1; i < MACHINE_COUNT; ++i)
+    if (machWordEq(w, kMnmMachines[i - 1].family)) { hit = i; n++; }
+  return n == 1 ? hit : (uint8_t)0xFF;
+}
+
+static void machPrintTrack(uint8_t t) {
+  Serial.printf("T%u = %s", t + 1, mnmMachineLabel(machineSel[t]));
+  if (machineSel[t]) {
+    Serial.print("   SYNT:");
+    for (uint8_t sl = 0; sl < 8; ++sl) Serial.printf(" %s", trackParamName(t, PAGE_SYNT, sl));
+  }
+  Serial.println();
+}
+
+static void machCommand(const char* a) {
+  while (*a == ' ') a++;
+  if (!*a) {
+    usbWait(128);
+    Serial.print("\nmachine per track: ");
+    for (uint8_t t = 0; t < 6; ++t) Serial.printf(" T%u %s ", t + 1, mnmMachineLabel(machineSel[t]));
+    Serial.println();
+    for (uint8_t i = 1; i < MACHINE_COUNT; ++i) {
+      if ((i - 1) % 6 == 0) { usbWait(96); Serial.print("\n "); }
+      Serial.printf(" %2u %-9s", i, mnmMachineLabel(i));
+    }
+    Serial.println(F("\nset one: mach <1-6> <name or number>   e.g. mach 1 sid,\n"
+                     "mach 2 fm+dyn, mach 3 0 (none). 'save' keeps them."));
+    return;
+  }
+  if (a[0] < '1' || a[0] > '6' || (a[1] != ' ' && a[1] != 0)) {
+    Serial.println("mach: track 1-6 first, e.g. mach 1 sid"); return; }
+  const uint8_t t = (uint8_t)(a[0] - '1');
+  a++;
+  while (*a == ' ') a++;
+  if (!*a) { machPrintTrack(t); return; }
+  char w[12]; uint8_t n = 0;
+  while (*a && *a != ' ' && n < sizeof(w) - 1) w[n++] = *a++;
+  w[n] = 0;
+  const uint8_t id = machParse(w);
+  if (id == 0xFF) { Serial.printf("mach: no machine called '%s' - 'mach' lists them\n", w); return; }
+  machineSel[t] = id;
+  uiTouch();
+  machPrintTrack(t);
+}
+
 static bool     rulerMode = false;   // 'disp' shows the panel ruler instead
 static bool     rowTestMode = false; // 'rows' shows the COM-line band test
 static uint32_t txRate = 0;          // bytes/s actually sent, last full second
@@ -9224,6 +9492,7 @@ static void handleMidiByte(uint8_t b) {
   const uint8_t ch = (uint8_t)(cvStatus & 0x0F);   // 0-based channel
   const uint8_t cc = cvData1, val = b;
   cvHave1 = false;                              // running status: reuse cvStatus
+  kitNoteCc(ch, cc, val);                       // v1.22: 'kit' / 'kit watch'
   if (captureCc(ch, cc, val)) mnmOut.noteUserActivity(micros());
 }
 
@@ -9359,6 +9628,11 @@ static void printHelp() {
     "  led <0-4>|all|off  drive one LED directly (4 = tempo)\n"
     "  dumpraw        capture one Monomachine SysEx dump as clean hex\n"
     "  dumpshow       reprint the last captured dump (to copy it again)\n"
+    "  mach           machine on each track, and all 22 to choose from\n"
+    "  mach <t> <m>   set it: mach 1 sid | mach 2 fm+dyn | mach 3 0 (none)\n"
+    "  kit            every track's parameters, named, as the machine sent them\n"
+    "  kit <1-6>      one track      kit clear   forget them all\n"
+    "  kit watch      print each CC from the machine as it arrives, named\n"
     "  rx             raw hex dump of MIDI IN 1\n"
     "  p2             raw hex dump of MIDI IN 2\n"
     "  loop           send a test pattern on OUT 1 (patch OUT1 -> IN2)\n"
@@ -9426,7 +9700,7 @@ static void printStatus() {
   usbWait(128);
   Serial.printf("TARGET  track %u  page %s  slot %u %s  %s %u%s\n",
       p.track + 1, kMnmPages[p.page].name, p.dest,
-      mnmParamName(p.page, p.dest), txMode == 3 ? "CC" : "yy", activeYY(),
+      trackParamName(p.track, p.page, p.dest), txMode == 3 ? "CC" : "yy", activeYY(),
       yyOverride >= 0 ? "  (raw override)" : "");
   Serial.printf("LFO 1   %s  %s  wave %s  trig %s  spd %u  mult %s  intl %u  dpth %u\n",
       p.enabled ? "ON " : "OFF", lfo.driving(0) ? "driving" : "idle",
@@ -9597,7 +9871,7 @@ static void handleCommand(const char* c) {
   if (isCmd(c, "ds")) { a = parseArg(c, false);
     if (a >= 0 && a < kMnmPages[lfo.p[0].page].count) { lfo.p[0].dest = (uint8_t)a;
       yyOverride = -1; mnmOut.resend();
-      Serial.printf("dest %s  addr %u\n", mnmParamName(lfo.p[0].page, a),
+      Serial.printf("dest %s  addr %u\n", destName(0),
                     activeYY()); } return; }
   if (isCmd(c, "w"))  { a = parseArg(c, false);
     if (a >= 0 && a < WAVE_COUNT) { lfo.p[0].wave = (uint8_t)a;
@@ -9631,7 +9905,7 @@ static void handleCommand(const char* c) {
     Serial.println(F("captured patch values (from the Monomachine's CC out):"));
     for (uint8_t i = 0; i < LFO_COUNT; ++i)
       Serial.printf("  LFO %u  %-4s CC %-3u  window %u..%u  captured %s%u\n",
-          i + 1, mnmParamName(lfo.p[i].page, lfo.p[i].dest),
+          i + 1, destName(i),
           mnmCC(lfo.p[i].page, lfo.p[i].dest), lfo.p[i].lo, lfo.p[i].hi,
           lfo.s[i].hasCap ? "" : "(none) ", lfo.s[i].capture);
     Serial.printf("captures seen so far: %lu\n", (unsigned long)rxCapture);
@@ -9946,6 +10220,33 @@ static void handleCommand(const char* c) {
                        "turns it off."));
     else Serial.println(F("dumpraw off"));
     return; }
+  if (isCmd(c, "mach")) { machCommand(c + 4); return; }
+  if (isCmd(c, "kit")) {
+    const char* a = c + 3; while (*a == ' ') a++;
+    if (a[0] == 'w') {
+      g_kitWatch = !g_kitWatch;
+      g_kitLogHead = g_kitLogTail = 0; g_kitLogLost = 0;
+      if (g_kitWatch)
+        Serial.println(F("\nkit watch ON: every CC the Monomachine sends prints here with\n"
+                         "its name and value. The machine must send its knobs as CC\n"
+                         "(its MIDI settings), on channels base..base+5.\n"
+                         "OPEN QUESTION to settle: turn SID WAVE from TRI to NOIS.\n"
+                         "  raw 0 1 2 3 4        -> lists are indexes (as built)\n"
+                         "  raw in big jumps     -> set MNM_LIST_SPREAD 1 in mnm_params.h\n"
+                         "'kit watch' again turns it off."));
+      else Serial.println("kit watch off");
+      return;
+    }
+    if (a[0] == 'c') {
+      memset(g_kitCc, 0xFF, sizeof(g_kitCc));
+      Serial.println("kit values forgotten"); return; }
+    if (a[0] >= '1' && a[0] <= '6') { kitPrintTrack((uint8_t)(a[0] - '1')); return; }
+    usbWait(128);
+    Serial.println(F("\nkit values the Monomachine has sent ('?' = not yet: turn that\n"
+                     "knob on the machine; 'mach' names the SYNT page per track)"));
+    for (uint8_t t = 0; t < 6; ++t) kitPrintTrack(t);
+    return;
+  }
   if (isCmd(c, "dumpshow")) {
     if (dumpLen) printDump();
     else Serial.println(F("nothing captured yet - arm 'dumpraw' and send a dump"));
@@ -10443,7 +10744,7 @@ void setup() {
   mnmOut.begin();
   mnmOut.setBaud(31250);
 
-  gMachine[0] = &kSid6581;     // example profile; delete or replace
+  memset(g_kitCc, 0xFF, sizeof(g_kitCc));   // v1.22: nothing heard yet
 
   // Six LFOs across the AMP page of track 1, a different waveform on each, at
   // slightly different rates so they drift out of phase and the CC stream never
@@ -10496,7 +10797,7 @@ void setup() {
                 (unsigned)MNM_BASE_CHANNEL);
   for (uint8_t i = 0; i < LFO_COUNT; ++i)
     Serial.printf("  LFO %u -> %-4s  CC %u  %s\n", i + 1,
-                  mnmParamName(lfo.p[i].page, lfo.p[i].dest),
+                  destName(i),
                   mnmCC(lfo.p[i].page, lfo.p[i].dest),
                   kTrigNames[lfo.p[i].trig]);
   Serial.println(F("All six LFOs are TRIG: press PLAY on the Monomachine and they\n"
@@ -10557,6 +10858,7 @@ void loop() {
   // from inside the display flush with /CS asserted, and two kilobytes of hex
   // to USB from there stalled the bus mid-frame.
   if (dumpReady) { dumpReady = false; printDump(); }
+  kitLogService();         // v1.22: 'kit watch' lines, into free USB space only
   if (dumpIn && (nowMs - dumpLastByteMs) > 500u) {
     dumpIn = false; rxSysex++;
     Serial.println(F("(no end-of-SysEx seen - printing what arrived)"));
