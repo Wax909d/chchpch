@@ -37,6 +37,9 @@ This builds the sketch on a PC with g++ against a small model of the Teensy API
 | `kit_test` | the parameter map (every list complete, every default in range, the FM+DYN ratios) and the kit model on it: init-kit values, learning from the machine's CCs but not from our own echo, names and values per machine, LFO centres and list ranges, PERF, the stick and pattern locks, `mach` / `kit` / `kit watch`, and presets from v1.21 (machines, wave order, MULT) - built twice, for both answers to the map's open question |
 | `turbo_test <scenario>` | TurboMIDI against a model of the Elektron machine, both ways round: the XY6 leading (byte for byte, keepalive, no caps, no ACK, bad echo, a machine slow to switch, machine power-cycled, `turbo off`, silent machine, a MIDI IN too slow for 10x) and the machine leading as a real one does (plain, during back-to-back display pushes, refused after `turbo off`), a MIDI IN that smears edges above 1x (the real test board's symptom), `turbo max`, and the `turbo loop` self-test |
 
+[`docs/ui-v1.24-before-after.png`](docs/ui-v1.24-before-after.png) shows PERF, EDIT, LFO and SET
+before and after the v1.24 redesign, each pair rendered from the firmware.
+
 `render_pages` draws every page of the UI into one PNG (`pages.png`, 3x), so a
 layout can be checked pixel for pixel without flashing: `run.sh` leaves it in
 `$TMPDIR/xy6-host-tests/`, or run `render_pages out.png 4` yourself.
