@@ -3,6 +3,42 @@
 // =============================================================================
 //
 // -----------------------------------------------------------------------------
+// WHAT CHANGED IN v1.24 - THE MONOMACHINE GRID
+// -----------------------------------------------------------------------------
+// Every page redrawn to sit beside the Monomachine: a rigid grid of 1px rules,
+// sharp pixels, and one inverted block for whatever is in focus. The rules are
+// in THE STYLE LAYER; each page's geometry is in the comment above it.
+//  * FIVE SHADES, ONE JOB EACH: WHITE primary data and the focus block, LIGHT
+//    secondary data, MID labels / frames / hints, DARK rules and empty bar
+//    space (never text), BLACK the ground. Text never goes below MID.
+//  * SHARP: no anti-aliasing anywhere - the scope trace, fader tops and
+//    meters used to split a pixel's intensity across two. Faders, cursors and
+//    meters snap instead of gliding, and page changes are CUT by default
+//    (DISSOLVE and the rest are still in SET > TRANSITION).
+//  * ONE FOCUS BLOCK: labels are plain 3x5 text now; only the selected
+//    parameter, row or track is a solid WHITE block with its text knocked
+//    out. Headers are bold 5x7 over a DARK rule; footers are 3x5 MID hints.
+//  * VALUES in the 5x7 LCD face, dropping to the 3x5 only when a value will
+//    not fit its cell (stText).
+//  * BARS: DARK empty space, WHITE value, no outline. Bipolar parameters (PAN,
+//    DIST, BOFS...) fill from the centre, lists (SID WAVE, TRIG, MULT...) show
+//    a block at their entry.
+//  * LFO EDIT is laid out as the Monomachine's LFO page: PAGE DEST TRIG WAVE /
+//    MULT SPD INTL DPTH as a 2 x 4 grid of cells, E1 walking them in reading
+//    order. Step probability is a solid fill height (was a checkerboard).
+//  * PERF is a 3 x 2 grid of cells on rules - name, value, a 6 x 106 bar - with
+//    the joystick as 1px meters at the two edges. The capsules, number chips
+//    and triangle cursor are gone.
+//  * 'style 0' draws the focus as a WHITE outline instead; 'invert 1' turns the
+//    whole OS dark-on-light with the hierarchy intact.
+//  * SET > FONT and 'font' are retired: the face is chosen by role on every
+//    page now, so the global switch no longer changed anything.
+//  * ONE FILE AGAIN: mnm_params.h is now the MONOMACHINE PARAMETER MAP section
+//    just below the #includes. A folder holding only the .ino failed with
+//    "mnm_params.h: No such file or directory"; nothing can go missing now.
+//  * test/host/render_pages draws every page into one PNG.
+//
+// -----------------------------------------------------------------------------
 // WHAT CHANGED IN v1.23 - PRESETS LOAD; THE STICK AND LOCKS FEED THE KIT MODEL
 // -----------------------------------------------------------------------------
 // v1.22 below, plus:
@@ -681,11 +717,345 @@
 #include <string.h>
 #include <math.h>          // sqrtf, used by the boot animation
 #include <stdarg.h>        // vsnprintf, used by the deferred turbo log
-// v1.22: every Monomachine parameter's range, init-kit default and value
-// names, as surveyed on the real machine. Lives beside this file in the
-// sketch folder; being a header, its types are declared before the IDE's
-// hoisted prototypes, so they are safe to use in signatures below.
-#include "mnm_params.h"
+
+// =============================================================================
+// MONOMACHINE PARAMETER MAP                          (mnm_params.h until v1.24)
+// =============================================================================
+// It lived in a header beside this file, and a sketch folder holding only
+// the .ino failed to compile: "mnm_params.h: No such file or directory".
+// Inside the sketch, it cannot go missing.
+//
+// It has to stay HERE, above the first function in the file. The Arduino IDE
+// inserts the prototypes it generates just before the first function
+// definition, and several of them name MnmParam - so every type in this
+// block is declared before its first function (mnmListIndex, at the end).
+//
+// Transcribed from Redot's hardware survey (Freeform board "Xy6", box
+// "Claude", Sep 2026): every parameter on every page and machine, its
+// display range, its init-kit default, and every value list, read off a
+// real Monomachine. Survey notation: "(x)" = value after loading a default
+// kit, "0-127" / "-64-63" / "on/off" = the parameter's range.
+//
+// Everything is prefixed kMnm / Mnm / mnm so it cannot collide with the
+// sketch, which owns page numbering (PAGE_*), CC numbers and names.
+//
+// Wire convention (confirmed by the survey itself): a bipolar -64..63
+// parameter is raw-64 on the wire. THRU/REVERB show INP as "(64) 0-127" and
+// CHORUS/DYNAMIX show it as "(0) -64..63" — the same raw 64.
+//
+// ONE OPEN QUESTION: for list parameters (SID WAVE, FM ratios, intervals,
+// phonemes, LFO WAVE/TRIG/MULT...) it is not yet known whether the CC value
+// is the list index (0,1,2,...) or spread across 0..127. Default here is
+// index, clamped. To check: 'kit watch' on the XY6 console, then turn SID
+// WAVE TRI->NOISE on the MnM. Raw 0,1,2,3,4 = leave as is. Big jumps = set
+// MNM_LIST_SPREAD 1. (FM+DYN FRQ has 128 entries, so it is exact either way.)
+
+#ifndef MNM_LIST_SPREAD
+#define MNM_LIST_SPREAD 0
+#endif
+
+// ---------------------------------------------------------------- kinds
+enum : uint8_t {
+  MNK_NONE = 0,   // unused slot ("X" on the survey)
+  MNK_U7,         // 0..127, shown as is
+  MNK_S7,         // -64..63, shown as raw-64
+  MNK_LIST,       // arg = MnmListId
+  MNK_SLOT,       // arg = MnmSlotId  (S01-S32, D01-D64)
+};
+
+typedef char MnmItem[6];                    // up to 5 chars + NUL
+
+// ---------------------------------------------------------------- lists
+static const MnmItem kMnmOnOff[]    = {"OFF","ON"};
+static const MnmItem kMnmSidWave[]  = {"TRI","SAW","PULS","MIX","NOIS"};
+static const MnmItem kMnmSidMod[]   = {"OFF","RING","SYNC","R+S"};
+static const MnmItem kMnmSidMsrc[]  = {"MFRQ","PTCH"};
+static const MnmItem kMnmDproSync[] = {"OFF","SFRQ","PTCH"};
+
+// FM+ STAT / PAR operator ratios. Entry 9 is written "5/32" on the survey but
+// sits between 3/8 and 7/16, so it is almost certainly 13/32 — check on the MnM.
+static const MnmItem kMnmFmRatio[] = {
+  "1/64","1/32","1/16","3/32","1/8","3/16","1/4","5/16","3/8","5/32",
+  "7/16","1/2","5/8","3/4","7/8","1","1.25","1.5","1.75","2",
+  "2.5","3","3.5","4"};
+
+// FM+ DYN ratios: exactly one entry per raw value — raw/64, truncated,
+// except raw 127 which reads 2.0. Verbatim from the survey.
+static const MnmItem kMnmDynRatio[128] = {
+  "0.0","1/64","1/32",".046","1/16",".078","3/32",".109","1/8",".140",
+  "5/32",".171","3/16",".203",".218",".234","1/4",".265",".281",".296",
+  "5/16",".328",".343",".359","3/8",".390",".406",".421","7/16",".453",
+  ".468",".484","1/2",".515",".531",".546","9/16",".578",".593",".609",
+  "5/8",".640",".656",".671",".687",".703",".718",".734","3/4",".765",
+  ".781",".796",".812",".828",".843",".859","7/8",".890",".906",".921",
+  ".937",".953",".968",".984","1.0","1.01","1.03","1.04","1.06","1.07",
+  "1.09","1.10","1.12","1.14","1.15","1.17","1.18","1.20","1.21","1.23",
+  "1.25","1.26","1.28","1.29","1.31","1.32","1.34","1.35","1.37","1.39",
+  "1.40","1.42","1.43","1.45","1.46","1.48","1.5","1.51","1.53","1.54",
+  "1.56","1.57","1.59","1.60","1.62","1.64","1.65","1.67","1.68","1.70",
+  "1.71","1.73","1.75","1.76","1.78","1.79","1.81","1.82","1.84","1.85",
+  "1.87","1.89","1.90","1.92","1.93","1.95","1.96","2.0"};
+
+// DPRO DENS (and SWAVE ENS) chord intervals, OFF in the middle.
+static const MnmItem kMnmInterval[] = {
+  "-12","-11","-10","-09","-08","2/3","-07","-06","-05","3/4","-04",
+  "4/5","5/6","-03","-02","-01","OFF","+01","+02","+03","6/5","5/4",
+  "+04","4/3","+05","+06","+07","3/2","+08","+09","+10","+11","+12"};
+#define MNM_INTERVAL_OFF 16
+
+static const MnmItem kMnmPhoneme[] = {
+  "-","B","D","F","G","H","J","K","L","M","N","P","R","RR","S","SJ",
+  "T","TH","TJ","V","Z"};
+
+// LFO — hardware order, which is the CC value order.
+static const MnmItem kMnmLfoPageName[] = {"PTCH","SYNT","AMP","FILT","EFFX",
+                                          "LFO1","LFO2","LFO3","MIDI"};
+static const MnmItem kMnmLfoTrig[] = {"FREE","TRIG","HOLD","ONE","HALF"};
+static const MnmItem kMnmLfoWave[] = {"TRI","ITRI","SAW","ISAW","SQR","ISQR",
+                                      "EXP","IEXP","RMP","IRMP","RND"};
+static const MnmItem kMnmLfoMult[] = {"1X","2X","4X","8X","16X","32X","64X"};
+// DEST's meaning depends on the same LFO's PAGE; the sketch names it. These
+// placeholders only give the list its size (eight destinations per page).
+static const MnmItem kMnmLfoDest[] = {"1","2","3","4","5","6","7","8"};
+static const MnmItem kMnmPtchDest[] = {"1/12","2/12","7/12","10CT","20CT",
+                                       "40CT","80CT","160CT"};
+static const MnmItem kMnmMidiDest[] = {"LEN","VEL","PB","PCHG",
+                                       "CC1","CC2","CC3","CC4"};
+
+enum MnmListId : uint8_t {
+  ML_ONOFF, ML_SIDWAVE, ML_SIDMOD, ML_SIDMSRC, ML_DPROSYNC, ML_FMRATIO,
+  ML_DYNRATIO, ML_INTERVAL, ML_PHONEME, ML_LFOPAGE, ML_LFOTRIG, ML_LFOWAVE,
+  ML_LFOMULT, ML_LFODEST, ML_PTCHDEST, ML_MIDIDEST, ML_COUNT };
+
+struct MnmList { const MnmItem* items; uint8_t n; };
+#define MNM_L(a) { a, (uint8_t)(sizeof(a) / sizeof(a[0])) }
+static const MnmList kMnmLists[ML_COUNT] = {
+  MNM_L(kMnmOnOff), MNM_L(kMnmSidWave), MNM_L(kMnmSidMod), MNM_L(kMnmSidMsrc),
+  MNM_L(kMnmDproSync), MNM_L(kMnmFmRatio), MNM_L(kMnmDynRatio),
+  MNM_L(kMnmInterval), MNM_L(kMnmPhoneme), MNM_L(kMnmLfoPageName),
+  MNM_L(kMnmLfoTrig), MNM_L(kMnmLfoWave), MNM_L(kMnmLfoMult),
+  MNM_L(kMnmLfoDest), MNM_L(kMnmPtchDest), MNM_L(kMnmMidiDest) };
+#undef MNM_L
+
+enum MnmSlotId : uint8_t { MS_S32, MS_D64 };        // S01-S32, D01-D64
+static const char    kMnmSlotPrefix[] = {'S', 'D'};
+static const uint8_t kMnmSlotCount[]  = {32, 64};
+
+// ---------------------------------------------------------------- params
+// def is the init-kit default: the raw wire value for U7/S7 (bipolar 0 ->
+// 64), the list INDEX for LIST/SLOT. mnmDefaultRaw() gives what to send.
+struct MnmParam { char name[5]; uint8_t kind; uint8_t def; uint8_t arg; };
+
+#define P_NONE           {"-",  MNK_NONE, 0,        0}
+#define P_U(n, d)        {n,    MNK_U7,   d,        0}
+#define P_S(n, d)        {n,    MNK_S7,   (uint8_t)((d) + 64), 0}
+#define P_L(n, l, d)     {n,    MNK_LIST, d,        l}
+#define P_ON(n, d)       {n,    MNK_LIST, d,        ML_ONOFF}
+#define P_SLOT(n, s)     {n,    MNK_SLOT, 0,        s}
+#define P_TUNE           P_S("TUNE", 0)
+
+// Track pages, slot order = encoder order = CC order.
+static const MnmParam kMnmAmpP[8] = {
+  P_U("ATCK", 0), P_U("HOLD", 0), P_U("DEC", 64), P_U("REL", 64),
+  P_S("DIST", 0), P_U("VOL", 64), P_S("PAN", 0),  P_U("PORT", 0) };
+
+static const MnmParam kMnmFiltP[8] = {
+  P_U("BASE", 0), P_U("WDTH", 127), P_U("HPQ", 0), P_U("LPQ", 0),
+  P_U("ATCK", 0), P_U("DEC", 32),   P_S("BOFS", 0), P_S("WOFS", 0) };
+
+// EQG is written 0-127 with default 0 on the survey, kept as written.
+static const MnmParam kMnmEffxP[8] = {
+  P_U("EQF", 64), P_U("EQG", 0),   P_U("SRR", 0),  P_U("DTIM", 64),
+  P_S("DSND", 0), P_U("DFB", 28),  P_U("DBAS", 0), P_U("DWID", 127) };
+
+// All three Monomachine LFOs share this layout (CC 88+i / 104+i / 112+i).
+// PAGE/DEST/TRIG/WAVE/MULT defaults were not on the survey: index 0.
+static const MnmParam kMnmLfoP[8] = {
+  P_L("PAGE", ML_LFOPAGE, 0), P_L("DEST", ML_LFODEST, 0),
+  P_L("TRIG", ML_LFOTRIG, 0), P_L("WAVE", ML_LFOWAVE, 0),
+  P_L("MULT", ML_LFOMULT, 0), P_U("SPD", 64), P_U("INTL", 0), P_U("DPTH", 0) };
+
+// ---------------------------------------------------------------- machines
+// Machine id in the sketch = index here + 1; 0 means "no machine chosen".
+struct MnmMachine { char family[6]; char name[5]; char label[9]; MnmParam p[8]; };
+
+static const MnmMachine kMnmMachines[] = {
+  {"GND", "GND", "GND-GND", {P_NONE, P_NONE, P_NONE, P_NONE,
+                             P_NONE, P_NONE, P_NONE, P_NONE}},
+  {"GND", "SIN", "GND-SIN", {P_NONE, P_NONE, P_NONE, P_NONE,
+                             P_NONE, P_NONE, P_NONE, P_TUNE}},
+  {"GND", "NOIS","GND-NOIS",{P_U("ST", 0), P_U("RED", 0), P_ON("STON", 1), P_NONE,
+                             P_NONE, P_NONE, P_NONE, P_TUNE}},
+
+  {"SID", "6581","SID-6581",{P_U("PW", 0), P_U("PWAD", 0), P_ON("PWRS", 1),
+                             P_L("WAVE", ML_SIDWAVE, 0),
+                             P_L("MOD", ML_SIDMOD, 0), P_L("MSRC", ML_SIDMSRC, 0),
+                             P_S("MFRQ", 0), P_TUNE}},
+
+  {"SWAVE","SAW", "SW-SAW", {P_U("UNIL", 0), P_U("UNIW", 0), P_U("UNIX", 0), P_NONE,
+                             P_U("SUBX", 0), P_U("SUB1", 0), P_U("SUB2", 0), P_TUNE}},
+  {"SWAVE","PULS","SW-PULSE",{P_U("UNIL", 0), P_U("UNIW", 0), P_U("SUB1", 0), P_U("SUB2", 0),
+                             P_S("PW", 0), P_U("PWAD", 0), P_ON("PWRS", 0), P_TUNE}},
+  // PCH2-4 values were not written for ENS; assumed to match DPRO DENS.
+  {"SWAVE","ENS", "SW-ENS", {P_L("PCH2", ML_INTERVAL, MNM_INTERVAL_OFF),
+                             P_L("PCH3", ML_INTERVAL, MNM_INTERVAL_OFF),
+                             P_L("PCH4", ML_INTERVAL, MNM_INTERVAL_OFF), P_U("WAVE", 0),
+                             P_S("PW", 0), P_U("CHM", 0), P_U("CHRW", 127), P_TUNE}},
+
+  // FM+ ratio defaults: 1/2 = idx 11, 1 = idx 15, 2 = idx 19.
+  {"FM+", "STAT","FM+STAT", {P_L("1FRQ", ML_FMRATIO, 11), P_S("1FIN", 0),
+                             P_U("1ENV", 80), P_U("1FB", 30),
+                             P_L("2FRQ", ML_FMRATIO, 15), P_U("2VOL", 64),
+                             P_U("TONE", 98), P_TUNE}},
+  {"FM+", "PAR", "FM+PAR",  {P_L("1FRQ", ML_FMRATIO, 11), P_U("1FIN", 64),
+                             P_L("2FRQ", ML_FMRATIO, 15), P_U("2ENV", 64),
+                             P_L("3FRQ", ML_FMRATIO, 19), P_U("3ENV", 80),
+                             P_U("TONE", 98), P_TUNE}},
+  // 2FRQ written (1.33) — not in the list (1.32 / 1.34); raw 85 = "1.32".
+  // 2FB written (30) or (32), unclear; 32 used.
+  {"FM+", "DYN", "FM+DYN",  {P_L("1FRQ", ML_DYNRATIO, 64), P_S("1FEN", 0),
+                             P_U("1VOL", 64), P_S("1VEN", 0),
+                             P_L("2FRQ", ML_DYNRATIO, 85), P_U("2ENV", 80),
+                             P_U("2FB", 32), P_TUNE}},
+
+  {"VO-6", "VO6", "VO-6",   {P_U("VOC1", 64), P_U("VOC2", 64), P_ON("V-SW", 1),
+                             P_U("VOIC", 0), P_L("CONS", ML_PHONEME, 0),
+                             P_U("CLEN", 64), P_U("CVOL", 64), P_TUNE}},
+
+  {"DPRO", "WAVE","DP-WAVE",{P_SLOT("WAVE", MS_S32), P_U("WP", 0), P_U("WPM", 0),
+                             P_ON("WPRS", 1), P_L("SYNC", ML_DPROSYNC, 0),
+                             P_U("SFRQ", 0), P_NONE, P_TUNE}},
+  {"DPRO", "BBOX","DP-BBOX",{P_U("PTCH", 64), P_U("STRT", 0), P_NONE, P_NONE,
+                             P_U("RTGR", 0), P_U("RTIM", 0), P_NONE, P_NONE}},
+  {"DPRO", "DDRW","DP-DDRW",{P_SLOT("WAV1", MS_D64), P_S("MIX", 0),
+                             P_SLOT("WAV2", MS_D64), P_U("TIME", 0),
+                             P_U("BR1", 0), P_U("WID", 0), P_U("BR2", 0), P_TUNE}},
+  {"DPRO", "DENS","DP-DENS",{P_L("PCH2", ML_INTERVAL, MNM_INTERVAL_OFF),
+                             P_L("PCH3", ML_INTERVAL, MNM_INTERVAL_OFF),
+                             P_L("PCH4", ML_INTERVAL, MNM_INTERVAL_OFF),
+                             P_SLOT("WAVE", MS_D64),
+                             P_NONE, P_U("CHM", 0), P_U("CHRW", 0), P_TUNE}},
+
+  {"FX", "THRU", "FX-THRU", {P_NONE, P_NONE, P_NONE, P_NONE,
+                             P_NONE, P_NONE, P_NONE, P_U("INP", 64)}},
+  {"FX", "REV",  "FX-REV",  {P_U("DEC", 64), P_U("DAMP", 0), P_U("GATE", 127), P_U("MIX", 32),
+                             P_U("HP", 0), P_U("LP", 127), P_NONE, P_U("INP", 64)}},
+  {"FX", "CHOR", "FX-CHOR", {P_U("DEL", 64), P_U("DEP", 64), P_U("SPD", 64), P_U("MIX", 127),
+                             P_U("FB", 0), P_U("WID", 0), P_U("LP", 127), P_S("INP", 0)}},
+  {"FX", "DYNX", "FX-DYNX", {P_U("ATK", 64), P_U("REL", 64), P_U("THRS", 64), P_U("MIX", 127),
+                             P_U("RAT", 0), P_U("GAIN", 0), P_U("RMS", 0), P_S("INP", 0)}},
+  {"FX", "RING", "FX-RING", {P_U("WAVE", 0), P_U("EXT", 0), P_NONE, P_U("MIX", 0),
+                             P_NONE, P_NONE, P_NONE, P_S("INP", 0)}},
+  {"FX", "PHAS", "FX-PHAS", {P_S("CNTR", 0), P_U("DEP", 64), P_U("SPD", 64), P_U("MIX", 127),
+                             P_S("FB", -19), P_U("WID", 0), P_NONE, P_S("INP", 0)}},
+  {"FX", "FLNG", "FX-FLNG", {P_U("DEL", 64), P_U("DEP", 64), P_U("SPD", 64), P_U("MIX", 127),
+                             P_S("FB", -19), P_U("WID", 0), P_NONE, P_S("INP", 0)}},
+};
+#define MNM_MACHINE_COUNT ((uint8_t)(sizeof(kMnmMachines) / sizeof(kMnmMachines[0])))
+
+#undef P_NONE
+#undef P_U
+#undef P_S
+#undef P_L
+#undef P_ON
+#undef P_SLOT
+#undef P_TUNE
+
+// ---------------------------------------------------------------- helpers
+
+// raw CC value -> list index (see MNM_LIST_SPREAD at the top).
+static inline uint8_t mnmListIndex(uint8_t raw, uint8_t n) {
+  raw &= 0x7F;
+#if MNM_LIST_SPREAD
+  if (n >= 128) return raw;
+  return (uint8_t)(((uint16_t)raw * n) >> 7);
+#else
+  return raw < n ? raw : (uint8_t)(n - 1);
+#endif
+}
+
+// list index -> raw CC value to send (inverse of the above).
+static inline uint8_t mnmListRaw(uint8_t idx, uint8_t n) {
+  if (idx >= n) idx = (uint8_t)(n - 1);
+#if MNM_LIST_SPREAD
+  if (n >= 128) return idx;
+  return (uint8_t)((((uint16_t)idx << 7) + n - 1) / n);      // first raw of the bin
+#else
+  return idx;
+#endif
+}
+
+// Number of entries behind a list/slot parameter, 0 for the plain kinds.
+static inline uint8_t mnmParamCount(const MnmParam& p) {
+  if (p.kind == MNK_LIST) return kMnmLists[p.arg].n;
+  if (p.kind == MNK_SLOT) return kMnmSlotCount[p.arg];
+  return 0;
+}
+
+// Highest raw value that means something for this parameter.
+static inline uint8_t mnmRawMax(const MnmParam& p) {
+  const uint8_t n = mnmParamCount(p);
+  return n ? mnmListRaw((uint8_t)(n - 1), n) : (uint8_t)127;
+}
+
+// Init-kit default as the raw CC value to send.
+static inline uint8_t mnmDefaultRaw(const MnmParam& p) {
+  const uint8_t n = mnmParamCount(p);
+  return n ? mnmListRaw(p.def, n) : p.def;
+}
+
+// Display text for one parameter value: at most 5 characters (list items
+// are at most 4 apart from the PTCH-page LFO destinations). out >= 6 bytes.
+static inline void mnmFormat(const MnmParam& p, uint8_t raw, char* out) {
+  raw &= 0x7F;
+  switch (p.kind) {
+    case MNK_U7: case MNK_S7: {
+      int v = (p.kind == MNK_S7) ? (int)raw - 64 : (int)raw;
+      if (v < 0) { *out++ = '-'; v = -v; }
+      char t[3]; uint8_t i = 0;
+      do { t[i++] = (char)('0' + v % 10); v /= 10; } while (v);
+      while (i) *out++ = t[--i];
+      *out = 0;
+      return;
+    }
+    case MNK_LIST: {
+      const MnmList& l = kMnmLists[p.arg];
+      memcpy(out, l.items[mnmListIndex(raw, l.n)], sizeof(MnmItem));
+      return;
+    }
+    case MNK_SLOT: {
+      const uint8_t s = (uint8_t)(mnmListIndex(raw, kMnmSlotCount[p.arg]) + 1);
+      out[0] = kMnmSlotPrefix[p.arg];
+      out[1] = (char)('0' + s / 10);
+      out[2] = (char)('0' + s % 10);
+      out[3] = 0;
+      return;
+    }
+    default:
+      out[0] = '-'; out[1] = 0;
+      return;
+  }
+}
+
+// Machine by id (1-based; 0 or out of range = none).
+static inline const MnmMachine* mnmMachine(uint8_t id) {
+  return (id >= 1 && id <= MNM_MACHINE_COUNT) ? &kMnmMachines[id - 1] : 0;
+}
+static inline const char* mnmMachineLabel(uint8_t id) {
+  const MnmMachine* m = mnmMachine(id);
+  return m ? m->label : "----";
+}
+
+// Machine id by family + name (e.g. "FM+", "DYN"), family may be null.
+// Returns 0 when not found.
+static inline uint8_t mnmFindMachine(const char* family, const char* name) {
+  for (uint8_t i = 0; i < MNM_MACHINE_COUNT; i++) {
+    const MnmMachine& m = kMnmMachines[i];
+    if (family && strcmp(family, m.family)) continue;
+    if (!strcmp(name, m.name)) return (uint8_t)(i + 1);
+  }
+  return 0;
+}
 
 // Forward declarations for functions defined further down. Only primitives in
 // the signatures, so the Arduino IDE's prototype-hoist quirk cannot bite us:
@@ -1050,7 +1420,7 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define PERF_FULL_FADERS   1
 
 // Shown on the boot screen and by the console. One place, so it cannot drift.
-#define XY6_VERSION              "1.23"
+#define XY6_VERSION              "1.24"
 
 // ---- Joystick (A0 / A1) -----------------------------------------------------
 // v1.17: the stick sends X and Y to every track picked on the JOY page (PERF
@@ -1133,12 +1503,10 @@ static uint8_t uiContrast = OLED_CONTRAST;
 #define JOY_FAST_CNT      16
 #define JOY_INTERVAL_US 8000        // 125 Hz ceiling
 // v1.14: the PERF page's X/Y meters hide themselves when the stick is idle.
-// Shown while the stick is off centre or has moved in the last JOY_HIDE_MS;
-// then they fade out over ~JOY_FADE_OUT_S x 4, and fade back in over
-// ~JOY_FADE_IN_S x 4 the moment the stick is touched. (Time constants.)
+// Shown while the stick is off centre or has moved in the last JOY_HIDE_MS.
+// (v1.24: they appear and go at once - the fades went with the Monomachine
+// grid, whose screen snaps.)
 #define JOY_HIDE_MS     3000
-#define JOY_FADE_IN_S   0.15f
-#define JOY_FADE_OUT_S  0.15f
 
 // v1.17: where the stick goes. Shared by the JOY page, the globals, the
 // console and the joystick code, which is why it lives up here.
@@ -1626,7 +1994,7 @@ enum StepProb : uint8_t {
 static const uint8_t kStepProbPct[PROB_COUNT] = {0, 10, 20, 33, 50, 66, 75, 90, 100};
 
 // Machine ids for the wizard's machine-select page and the SET page's
-// MACHINES block: 0 = none, 1..22 = the surveyed machines in mnm_params.h,
+// MACHINES block: 0 = none, 1..22 = the surveyed machines in the parameter map,
 // named by mnmMachineLabel(). v1.22 replaced a guessed list of 12 names
 // (SIDLEAD, SIDBASS... do not exist on this machine) with the real one.
 static const uint8_t MACHINE_COUNT = (uint8_t)(MNM_MACHINE_COUNT + 1);
@@ -1780,15 +2148,29 @@ static uint8_t uiFont = UIFONT_3X5;      // mockup-accurate by default
 static const int16_t GFX_W = 64;
 static const int16_t GFX_H = 256;
 
-// The shade ramp. SH_DIM used to be 5 — a third of full brightness — which is
-// simply not readable on this panel with any light in the room. Anything that
-// is a word now sits at SH_MID or above; SH_FAINT is for rules and grid dots
-// only, never for text you are expected to read.
-static const uint8_t SH_OFF   = 0;    // background
-static const uint8_t SH_FAINT = 4;    // hairlines, graticules, off-cells
-static const uint8_t SH_DIM   = 9;    // secondary text — legible, not shouting
-static const uint8_t SH_MID   = 12;   // waveform traces, active secondary text
-static const uint8_t SH_ON    = 15;   // primary text, borders, cursors
+// v1.24 - FIVE SHADES, ONE JOB EACH. The Monomachine's screen is two-tone; this
+// panel has sixteen greys, and five of them, each with a fixed role, give the
+// pages depth without any softness. Every pixel the UI draws is one of these
+// five at full strength - no blending, no anti-aliasing, no partial pixel
+// anywhere. (The one exception is the DISSOLVE page transition, which is a
+// setting and off by default.)
+//
+//   G_WHITE  15  primary data: values, the focus block, bar fills, the trace
+//   G_LIGHT  12  secondary data: the name beside a value, the machine, idle traces
+//   G_MID     9  labels out of focus, frames, hints, inactive track numbers
+//   G_DARK    4  region rules, empty bar space, guides - NEVER text
+//   G_BLACK   0  the ground
+//
+// Text never goes below G_MID. 5/15 was measured unreadable on this panel with
+// any light in the room (the reason SH_DIM became 9), so the darkest grey only
+// ever draws lines and empty space - an inactive track number is MID.
+static const uint8_t G_BLACK = 0, G_DARK = 4, G_MID = 9, G_LIGHT = 12, G_WHITE = 15;
+// The names the rest of the file grew up with, as aliases of the roles.
+static const uint8_t SH_OFF   = G_BLACK;
+static const uint8_t SH_FAINT = G_DARK;
+static const uint8_t SH_DIM   = G_MID;
+static const uint8_t SH_MID   = G_LIGHT;
+static const uint8_t SH_ON    = G_WHITE;
 
 static uint8_t g_fb[PANEL_W * PANEL_H / 2];
 
@@ -3619,7 +4001,7 @@ static const char* mnmParamName(uint8_t page, uint8_t slot) {
 
 // =========================== MONOMACHINE VALUE MAP ===========================
 // v1.22. What every parameter IS - its range, its init-kit default, its value
-// names - comes from mnm_params.h, transcribed from a survey of the real
+// names - comes from the parameter map near the top of this file, from a survey of the real
 // machine. This section adds what each track's parameters currently HOLD.
 //
 // THE KIT MODEL. One byte per parameter per track - 7 pages x 8, the same 56
@@ -6279,265 +6661,254 @@ static void waveGlyph(int16_t x, int16_t y, uint8_t wave, uint8_t shade) {
   }
 }
 
-// Right-aligned text with the background knocked out behind it. A live value
-// printed straight over a moving waveform trace is unreadable exactly when you
-// most want to read it, so the number gets a one-pixel margin of black to sit
-// in. Cheap, and it is what makes a scope usable as a read-out rather than as
-// decoration.
-static void textRightKnock(int16_t rx, int16_t y, const char* s, uint8_t shade) {
-  const int16_t w = gfx.width35(s);
-  gfx.fillRect((int16_t)(rx - w - 1), (int16_t)(y - 1),
-               (int16_t)(w + 2), 7, SH_OFF);
-  gfx.text35R(rx, y, s, shade);
-}
-
 // =============================================================================
-// SECTION: THE STYLE LAYER                                         new in v7.1
+// SECTION: THE STYLE LAYER                          new in v7.1, rebuilt v1.24
 // =============================================================================
 //
-// One visual vocabulary, used by every page, so the OS looks like one machine
-// instead of eight screens that grew separately. Straight off the mockup:
+// v1.24: THE MONOMACHINE GRID. Every page is built from the same few pieces,
+// and they now follow the machine this box sits next to:
 //
-//   CHIP          a filled block with the label knocked out of it in black.
-//                 This is the unit the whole design is built from - headers,
-//                 row labels, soft keys, selected items.
-//   ITEM          the same block when selected, an OUTLINED box when not. That
-//                 one substitution is the entire selection language: no
-//                 cursors, no brightness steps, no carets to hunt for.
-//   PAIR          two label chips side by side with their values underneath -
-//                 the settings grid.
-//   BOX           a bordered group with its title chip sitting on the top edge.
-//   BAR           outline plus proportional fill.
+//   GRID     regions split by 1px G_DARK rules, the full width or height -
+//            header from body, cell from cell, bank from bank.
+//   TYPE     values in the 5x7 LCD face (the 3x5 only where 5x7 will not fit
+//            the cell - stText decides), labels in the 3x5, 4 letters max.
+//   FOCUS    exactly one solid G_WHITE block per page with its text knocked
+//            out in black: the selected parameter, row or track. Nothing else
+//            is filled, outlined or boxed, so the block is where the eye lands.
+//   BAR      G_DARK empty space, G_WHITE value, no outline. Bipolar parameters
+//            fill from the centre, lists show a block at their entry.
 //
-// -----------------------------------------------------------------------------
-// A NOTE YOU SHOULD READ BEFORE COMMITTING TO THIS ON HARDWARE
-// -----------------------------------------------------------------------------
-// This file previously argued, at length, for removing exactly this look: on a
-// passive-matrix OLED the lit pixels bloom sideways into the unlit ones, and at
-// a 3-pixel glyph width the bloom is comparable to the stroke width, so the
-// counters inside A, B, D, O and R fill in and knocked-out words turn into
-// bright smears. That is why every chip was stripped out and replaced with
-// bright strokes on black.
+// The old vocabulary - every label a filled chip, an outline for "not
+// selected" - put six to eight white blocks on every page, and the selection
+// was one block among them.
 //
-// The mockup is built entirely from chips, so the chips are back - but the
-// argument was never settled on hardware, only on a screenshot, and it cannot
-// be settled from here either. So the style is a RUNTIME SWITCH, not a rewrite:
-//
-//     style 1     inverted chips, exactly as drawn in the mockup   (default)
-//     style 0     the same layout with every chip drawn as bright
-//                 strokes on black instead
-//
-// Same geometry, same rows, same everything - only the fill inverts. Type both
-// on the panel with a room light on and keep whichever you can actually read.
+// 'style 0' is kept for a panel whose bloom eats knocked-out text: the focus
+// block becomes a G_WHITE outline with WHITE text in it. Same geometry.
 static bool uiChipStyle = true;
 
-static const int16_t ST_CHIP_H = 7;    // 5px glyph + 1px padding top and bottom
-static const int16_t ST_ROW    = 9;    // row pitch: chip plus breathing room
-static const int16_t ST_HDR_Y  = 0;
-static const int16_t ST_BODY_Y = 11;
-static const int16_t ST_FOOT_Y = 248;
+static const int16_t ST_CHIP_H = 7;    // a 3x5 label line: 5px glyph + 1px each side
+static const int16_t ST_ROW    = 9;    // a list row: a 5x7 line + 1px each side
+static const int16_t ST_HDR_Y  = 0;    // header text row 1..7, rule at y 9
+static const int16_t ST_BODY_Y = 11;   // first body pixel below the header rule
+static const int16_t ST_FOOT_Y = 249;  // footer hints, under the rule at y 246
 
-// Width a chip needs for a given label.
-static int16_t stChipW(const char* t) { return (int16_t)(gfx.width35(t) + 5); }
+// The focus block. Returns the shade to draw the text inside it in.
+static uint8_t stFocus(int16_t x, int16_t y, int16_t w, int16_t h) {
+  if (uiChipStyle) { gfx.fillRect(x, y, w, h, G_WHITE); return G_BLACK; }
+  gfx.rect(x, y, w, h, G_WHITE);
+  return G_WHITE;
+}
 
-// The primitive. Everything else is built from it.
+// Width a 3x5 label needs inside a focus block (2px of air each side).
+static int16_t stChipW(const char* t) { return (int16_t)(gfx.width35(t) + 4); }
+
+// A 3x5 label. Focused: the block with the text knocked out. Not focused:
+// plain G_MID text in exactly the same place, so moving the focus never
+// shifts a pixel of the layout.
 static void stChip(int16_t x, int16_t y, int16_t w, const char* t, bool on) {
-  if (on && uiChipStyle) {
-    gfx.fillRect(x, y, w, ST_CHIP_H, SH_ON);
-    gfx.text35((int16_t)(x + 2), (int16_t)(y + 1), t, SH_OFF);
-  } else if (on) {
-    // style 0: the selected state has to stay unmistakable without inverting,
-    // so it keeps the box and runs the text at full brightness inside it.
-    gfx.rect(x, y, w, ST_CHIP_H, SH_ON);
-    gfx.text35((int16_t)(x + 2), (int16_t)(y + 1), t, SH_ON);
-  } else {
-    gfx.rect(x, y, w, ST_CHIP_H, SH_DIM);
-    gfx.text35((int16_t)(x + 2), (int16_t)(y + 1), t, SH_MID);
-  }
+  const uint8_t sh = on ? stFocus(x, y, w, ST_CHIP_H) : G_MID;
+  gfx.text35((int16_t)(x + 2), (int16_t)(y + 1), t, sh);
 }
 static int16_t stChipAuto(int16_t x, int16_t y, const char* t, bool on = true) {
   const int16_t w = stChipW(t);
   stChip(x, y, w, t, on);
   return w;
 }
-static int16_t stChipRight(int16_t rx, int16_t y, const char* t, bool on = true) {
-  const int16_t w = stChipW(t);
-  const int16_t x = (int16_t)(rx - w + 1);
-  stChip(x, y, w, t, on);
-  return x;
+
+// A value in the 5x7 LCD face when it fits in maxW, else in the 3x5 - so a
+// long list entry ("160CT", "F000203C") shrinks instead of running into its
+// neighbour. y is the top of a 7px line; the 3x5 sits one pixel down in it,
+// on the same centre. align 0: x is the left edge; 1: x is the centre;
+// 2: x is one past the right edge (the text35R convention). Returns the width.
+static int16_t stText(int16_t x, int16_t y, int16_t maxW, const char* s, uint8_t sh,
+                      uint8_t align) {
+  const bool big = gfx.textWidth(s) <= maxW;
+  const int16_t w = big ? gfx.textWidth(s) : gfx.width35(s);
+  const int16_t x0 = (align == 0) ? x : (align == 1) ? (int16_t)(x - w / 2) : (int16_t)(x - w);
+  if (big) gfx.text(x0, y, s, sh);
+  else     gfx.text35(x0, (int16_t)(y + 1), s, sh);
+  return w;
 }
 
-// Header: page identity on the left, mode or status on the right, hairline
-// under both. Every page starts with this, which is most of why they read as
-// one instrument.
+// Header: the page's name in bold 5x7 WHITE on the left, its state in 5x7
+// LIGHT on the right, one G_DARK rule the full width under both at y 9. The
+// header is identity, not focus, so it is never a block.
 static void stHeader(const char* left, const char* right) {
-  // Both header chips filled, as in the mockup: the title bar is the one band
-  // on the page that should read from across the room without being looked at.
-  stChipAuto(0, ST_HDR_Y, left, true);
-  if (right) stChipRight((int16_t)(UI_W - 1), ST_HDR_Y, right, true);
-  gfx.hLine(0, (int16_t)(ST_HDR_Y + ST_CHIP_H + 1), UI_W, SH_DIM);
+  int16_t lw;
+  if (gfx.textBoldWidth(left) <= UI_W - 20) {
+    gfx.textBold(0, (int16_t)(ST_HDR_Y + 1), left, G_WHITE);
+    lw = gfx.textBoldWidth(left);
+  } else {
+    gfx.text(0, (int16_t)(ST_HDR_Y + 1), left, G_WHITE);
+    lw = gfx.textWidth(left);
+  }
+  if (right) stText(UI_W, (int16_t)(ST_HDR_Y + 1), (int16_t)(UI_W - lw - 3), right, G_LIGHT, 2);
+  gfx.hLine(0, (int16_t)(ST_HDR_Y + 9), UI_W, G_DARK);
 }
 
-// Footer soft keys, same two-chip shape as the header so the page is bracketed.
+// Footer: encoder hints in 3x5 G_MID under a G_DARK rule at y 246. They are
+// help, not data, so they are the quietest text on the page.
 static void stFooter(const char* left, const char* right) {
-  gfx.hLine(0, (int16_t)(ST_FOOT_Y - 2), UI_W, SH_DIM);
-  if (left)  stChipAuto(0, ST_FOOT_Y, left, true);
-  if (right) stChipRight((int16_t)(UI_W - 1), ST_FOOT_Y, right, true);
+  gfx.hLine(0, (int16_t)(ST_FOOT_Y - 3), UI_W, G_DARK);
+  if (left)  gfx.text35(0, ST_FOOT_Y, left, G_MID);
+  if (right) gfx.text35R(UI_W, ST_FOOT_Y, right, G_MID);
 }
 
-// A label chip with its value right-aligned on the same line. `sel` promotes
-// the VALUE to a chip, which is how a settings cursor reads without spending a
-// column on a caret.
+// A list row, ST_ROW tall: label in 3x5 G_MID at the left, value in WHITE at
+// the right (5x7 when it fits). The focused row is ONE block the full width
+// with label and value knocked out of it - an Elektron menu line.
 static void stRow(int16_t y, const char* label, const char* value, bool sel) {
-  // A 3px gutter is reserved on every row, selected or not, so the rows do not
-  // shuffle sideways as the cursor moves - movement in the label column reads
-  // as a glitch, not as a cursor.
-  if (sel) gfx.fillRect(0, y, 2, ST_CHIP_H, SH_ON);
-  stChipAuto(3, y, label, true);          // labels are ALWAYS filled
-  if (!value || !*value) return;
-  // The selected row's VALUE gets the box. That is the only difference between
-  // a row you are editing and a row you are reading, and it lands on the half
-  // of the row you are actually looking at.
-  if (sel) stChipRight((int16_t)(UI_W - 1), y, value, true);
-  else     gfx.text35R((int16_t)(UI_W - 2), (int16_t)(y + 1), value, SH_ON);
+  uint8_t lsh = G_MID, vsh = G_WHITE;
+  if (sel) lsh = vsh = stFocus(0, y, UI_W, ST_ROW);
+  gfx.text35(2, (int16_t)(y + 2), label, lsh);
+  if (value && *value)
+    stText((int16_t)(UI_W - 1), (int16_t)(y + 1),
+           (int16_t)(UI_W - gfx.width35(label) - 7), value, vsh, 2);
 }
 
-// Bordered group with its title chip riding the top edge.
+// Bordered group: a 1px G_MID frame, its title in 3x5 G_LIGHT set into a gap
+// cut in the top edge.
 static void stBox(int16_t x, int16_t y, int16_t w, int16_t h, const char* title) {
-  gfx.rect(x, y, w, h, SH_ON);
-  if (title) stChipAuto((int16_t)(x + 2), y, title, true);
+  gfx.rect(x, y, w, h, G_MID);
+  if (!title) return;
+  const int16_t tw = gfx.width35(title);
+  gfx.hLine((int16_t)(x + 2), y, (int16_t)(tw + 4), G_BLACK);
+  gfx.text35((int16_t)(x + 4), (int16_t)(y - 2), title, G_LIGHT);
 }
 
-// Outline plus proportional fill. Used for every 0..max quantity on every page,
-// so a bar always means the same thing.
+// ---- bars -------------------------------------------------------------------
+// One bar for every quantity on every page: G_DARK is the empty space, the
+// value is solid, and there is no outline - so a bar always reads the same.
+//   BAR_FILL     from the left (or the bottom)
+//   BAR_CENTRE   bipolar: from the centre either way; at centre, a 1px line
+//   BAR_THUMB    a list: a block at the entry's place, as wide as one entry
+enum : uint8_t { BAR_FILL = 0, BAR_CENTRE, BAR_THUMB };
+
+static void stBarH(int16_t x, int16_t y, int16_t w, int16_t h, int32_t v, int32_t vmax,
+                   uint8_t mode, uint8_t sh) {
+  if (w < 2 || h < 1) return;
+  gfx.fillRect(x, y, w, h, G_DARK);
+  if (vmax <= 0) return;
+  if (v < 0) v = 0;
+  if (v > vmax) v = vmax;
+  if (mode == BAR_THUMB) {
+    int16_t tw = (int16_t)(w / (vmax + 1));
+    if (tw < 2) tw = 2;
+    gfx.fillRect((int16_t)(x + (int32_t)(w - tw) * v / vmax), y, tw, h, sh);
+  } else if (mode == BAR_CENTRE) {
+    const int16_t c = (int16_t)(x + (int32_t)(w - 1) * ((vmax + 1) / 2) / vmax);
+    const int16_t q = (int16_t)(x + (int32_t)(w - 1) * v / vmax);
+    gfx.fillRect(q < c ? q : c, y, (int16_t)((q < c ? c - q : q - c) + 1), h, sh);
+  } else {
+    const int16_t f = (int16_t)(((int32_t)w * v + vmax / 2) / vmax);
+    if (f > 0) gfx.fillRect(x, y, f, h, sh);
+  }
+}
+// The same, standing up: value from the bottom (or the middle).
+static void stBarV(int16_t x, int16_t y, int16_t w, int16_t h, int32_t v, int32_t vmax,
+                   uint8_t mode, uint8_t sh) {
+  if (h < 2 || w < 1) return;
+  gfx.fillRect(x, y, w, h, G_DARK);
+  if (vmax <= 0) return;
+  if (v < 0) v = 0;
+  if (v > vmax) v = vmax;
+  const int16_t b = (int16_t)(y + h - 1);                     // bottom row
+  if (mode == BAR_THUMB) {
+    int16_t th = (int16_t)(h / (vmax + 1));
+    if (th < 2) th = 2;
+    gfx.fillRect(x, (int16_t)(b - th + 1 - (int32_t)(h - th) * v / vmax), w, th, sh);
+  } else if (mode == BAR_CENTRE) {
+    const int16_t c = (int16_t)(b - (int32_t)(h - 1) * ((vmax + 1) / 2) / vmax);
+    const int16_t q = (int16_t)(b - (int32_t)(h - 1) * v / vmax);
+    gfx.fillRect(x, q < c ? q : c, w, (int16_t)((q < c ? c - q : q - c) + 1), sh);
+  } else {
+    const int16_t f = (int16_t)(((int32_t)h * v + vmax / 2) / vmax);
+    if (f > 0) gfx.fillRect(x, (int16_t)(b - f + 1), w, f, sh);
+  }
+}
+// A Monomachine parameter's bar: its own range and its own kind - SID WAVE
+// is five entries, PAN is bipolar, VOL runs 0..127. raw is the wire value.
+static void stParamBar(int16_t x, int16_t y, int16_t w, int16_t h, bool vertical,
+                       uint8_t page, uint8_t slot, uint8_t track, uint8_t raw, uint8_t sh) {
+  const MnmParam* d = paramDef(page, slot, track);
+  const uint8_t n = d ? mnmParamCount(*d) : 0;
+  int32_t v = raw & 0x7F, vmax = 127;
+  uint8_t mode = (d && d->kind == MNK_S7) ? BAR_CENTRE : BAR_FILL;
+  if (n > 1) { v = mnmListIndex(raw, n); vmax = n - 1; mode = BAR_THUMB; }
+  if (vertical) stBarV(x, y, w, h, v, vmax, mode, sh);
+  else          stBarH(x, y, w, h, v, vmax, mode, sh);
+}
+// Where a raw value lands along a parameter's bar, 0..len-1 from the start
+// (left, or bottom) - for marking a centre across a bar.
+static int16_t stParamPos(int16_t len, uint8_t page, uint8_t slot, uint8_t track, uint8_t raw) {
+  const MnmParam* d = paramDef(page, slot, track);
+  const uint8_t n = d ? mnmParamCount(*d) : 0;
+  if (n > 1) return (int16_t)((int32_t)(len - 1) * mnmListIndex(raw, n) / (n - 1));
+  return (int16_t)((int32_t)(len - 1) * (raw & 0x7F) / 127);
+}
+
+// Every horizontal bar the pages had before v1.24 comes through here.
 static void stBar(int16_t x, int16_t y, int16_t w, int16_t h,
                   int32_t v, int32_t vmax) {
-  gfx.rect(x, y, w, h, SH_ON);
-  if (vmax <= 0) return;
-  int32_t f = ((int32_t)(w - 2) * v) / vmax;
-  if (f < 0) f = 0;
-  if (f > w - 2) f = w - 2;
-  if (f) gfx.fillRect((int16_t)(x + 1), (int16_t)(y + 1), (int16_t)f,
-                      (int16_t)(h - 2), SH_ON);
-}
-
-// A step/slot cell. Empty, checkered (partial) or solid - the three states the
-// mockup's little squares come in.
-static void stCell(int16_t x, int16_t y, int16_t sz, uint8_t pct, bool cur) {
-  gfx.rect(x, y, sz, sz, cur ? SH_ON : SH_DIM);
-  if (!pct) return;
-  if (pct >= 100) {
-    gfx.fillRect((int16_t)(x + 2), (int16_t)(y + 2),
-                 (int16_t)(sz - 4), (int16_t)(sz - 4), SH_ON);
-  } else {
-    // Checkerboard, with density following the percentage. A solid partial fill
-    // would read as "on" from across the room; a texture never does.
-    const int16_t in = (int16_t)(sz - 4);
-    int16_t fh = (int16_t)((in * pct) / 100);
-    if (fh < 1) fh = 1;
-    for (int16_t j = 0; j < fh; ++j)
-      for (int16_t i = 0; i < in; ++i)
-        if (((i + j) & 1) == 0)
-          gfx.px((int16_t)(x + 2 + i), (int16_t)(y + sz - 2 - fh + j), SH_ON);
-    gfx.hLine((int16_t)(x + 2), (int16_t)(y + sz - 2 - fh), in, SH_MID);
-  }
+  stBarH(x, y, w, h, v, vmax, BAR_FILL, G_WHITE);
 }
 
 // The trace is drawn by calling the same lfoShape() the engine uses to produce
 // the outgoing value, so the picture cannot disagree with what you hear.
 //
-// v1.10 - THE SCOPE, REDRAWN. What changed, and why each one reads better:
-//   * No box. Six stacked 1-px rectangles made the page a grid of frames; four
-//     3-px corner marks say "this is a window" with a fraction of the ink.
-//   * Anti-aliased trace. Each column's height is kept as a fraction and a
-//     near-flat run is split across the two pixels it falls between, in
-//     proportion. A sine or a slow ramp now reads as a curve instead of a
-//     staircase of 2-px blocks - the single biggest step up on a 16-grey panel.
-//   * Progress. While the LFO is driving, the part of the cycle already played
-//     is drawn bright and the part still to come a step dimmer, so the playhead
-//     is a boundary you can read at a glance, not just a line.
-//   * The playhead is one clean vertical line sweeping forward - no marker
-//     on the trace, which the bright/dim split already makes unnecessary.
-// Every pixel is max-blended, so crossing strokes never erase each other.
-static inline void pxMax(int16_t x, int16_t y, uint8_t s) {
-  if (s > gfx.get(x, y)) gfx.px(x, y, s);
-}
+// v1.24 - SHARP. One pixel of trace per column, joined to the last by a
+// vertical span: every pixel is drawn at full shade or not drawn. (v1.10 split
+// each column's intensity across two pixels - anti-aliasing, which is exactly
+// the softness the Monomachine's screen does not have.) Inside a 1px frame -
+// G_MID for the window in focus, G_DARK otherwise - a G_DARK dotted zero line,
+// and while the LFO drives, the part of the cycle already played in WHITE and
+// the rest in G_MID, split by a 1px G_LIGHT playhead.
 static void drawWaveBox(int16_t x, int16_t y, int16_t w, int16_t h,
                         uint8_t idx, bool playhead, uint8_t border) {
   const LfoParams& p = lfo.p[idx];
   const LfoState&  s = lfo.s[idx];
+  const bool hot = (border == G_WHITE);          // selected, enabled window
+  gfx.rect(x, y, w, h, hot ? G_MID : G_DARK);
   const int16_t ix = (int16_t)(x + 1), iy = (int16_t)(y + 1);
   const int16_t iw = (int16_t)(w - 2), ih = (int16_t)(h - 2);
   if (iw < 4 || ih < 4) return;
-  const bool    hot  = (border == SH_ON);          // selected / enabled window
-
-  // Corner marks, in the frame's shade.
-  { const int16_t r = (int16_t)(x + w - 1), btm = (int16_t)(y + h - 1);
-    const uint8_t c = hot ? SH_MID : SH_FAINT;
-    gfx.hLine(x, y, 3, c);                 gfx.vLine(x, y, 3, c);
-    gfx.hLine((int16_t)(r - 2), y, 3, c);  gfx.vLine(r, y, 3, c);
-    gfx.hLine(x, btm, 3, c);               gfx.vLine(x, (int16_t)(btm - 2), 3, c);
-    gfx.hLine((int16_t)(r - 2), btm, 3, c); gfx.vLine(r, (int16_t)(btm - 2), 3, c); }
-
   const int16_t mid = (int16_t)(iy + ih / 2), half = (int16_t)((ih - 1) / 2);
-  gfx.dotHLine(ix, mid, iw, SH_FAINT, 3);
+  gfx.dotHLine(ix, mid, iw, G_DARK, 2);
 
   const int16_t hx = playhead
       ? (int16_t)(ix + (int16_t)(((uint64_t)s.phase * iw) >> 32)) : (int16_t)-1;
-  // The playhead is a single vertical line sweeping forward - no dot. Drawn
-  // before the trace and max-blended, so where the two cross the brighter one
-  // wins and neither cuts the other.
-  if (playhead) gfx.vLine(hx, iy, ih, hot ? SH_MID : SH_DIM);
+  if (playhead) gfx.vLine(hx, iy, ih, G_LIGHT);
+  const uint8_t shPast = hot ? G_WHITE : G_LIGHT;
+  const uint8_t shNext = G_MID;
+  const uint8_t shIdle = hot ? G_WHITE : G_LIGHT;  // not driving: one shade
 
-  // Brightness of the played / unplayed trace.
-  const uint8_t shPast = hot ? SH_ON  : SH_MID;
-  const uint8_t shNext = hot ? SH_MID : SH_DIM;
-  const uint8_t shIdle = hot ? SH_MID : SH_DIM;    // not driving: one shade
-
-  // ONE divide per box, not one per column: the phase advances by a constant
-  // across the width, so it is an accumulator. The RND seed steps the same way.
+  // ONE divide per box: the phase advances by a constant across the width.
   const uint32_t phStep   = (uint32_t)(0x100000000ULL / (uint32_t)iw);
-  // uint32_t, not uint16_t: at iw <= 16 a 16-bit step would truncate.
   const uint32_t seedStep = (16u * 65536u) / (uint32_t)iw;
   const bool     isRnd    = (p.wave == WAVE_RND);
   // Depth AND amount, so the trace is the truth: pulling E4 down flattens the
   // picture exactly as much as it flattens what goes on the wire.
-  const float    gainF = (float)p.depth * (float)(p.amount < 127 ? p.amount : 127)
-                         / (127.0f * 128.0f * 32768.0f) * (float)half;
+  const float gainF = (float)p.depth * (float)(p.amount < 127 ? p.amount : 127)
+                      / (127.0f * 128.0f * 32768.0f) * (float)half;
   uint32_t ph = 0, seedA = 0;
-  float prevF = (float)mid;
+  int16_t prev = mid;
   for (int16_t i = 0; i < iw; ++i) {
-    // RND holds one value per cycle; a flat line would say nothing, so the
-    // preview shows the staircase across sixteen consecutive cycles.
+    // RND holds one value per cycle; the preview shows sixteen cycles of it.
     const uint32_t seed = isRnd ? (0x5EEDu + (seedA >> 16)) : 0x5EEDu;
     int32_t v = lfoShape(p.wave, ph, seed);
     if (p.intl) { const uint32_t g = ph * (uint32_t)p.intl;
                   if (g & 0x80000000u) v = 0; }
-    const float yf = (float)mid - (float)v * gainF;
-    if (i == 0) prevF = yf;
+    int16_t yy = (int16_t)lroundf((float)mid - (float)v * gainF);
+    if (yy < iy) yy = iy;
+    if (yy > iy + ih - 1) yy = (int16_t)(iy + ih - 1);
+    if (i == 0) prev = yy;
     const int16_t cx = (int16_t)(ix + i);
     const uint8_t sh = !playhead ? shIdle : (cx <= hx ? shPast : shNext);
-
-    if (fabsf(yf - prevF) < 1.0f) {
-      // Near-flat: split this column's intensity across the two pixels the
-      // exact height falls between.
-      const float   fy  = floorf(yf);
-      const float   fr  = yf - fy;
-      const int16_t y0  = (int16_t)fy;
-      pxMax(cx, y0,               (uint8_t)((1.0f - fr) * sh + 0.5f));
-      pxMax(cx, (int16_t)(y0 + 1), (uint8_t)(fr * sh + 0.5f));
-    } else {
-      // Steep: a solid span joins the columns; the ends are already where the
-      // eye expects them, so they need no blending.
-      const int16_t a0 = (int16_t)lroundf(prevF), a1 = (int16_t)lroundf(yf);
-      const int16_t lo = a0 < a1 ? a0 : a1, hi2 = a0 < a1 ? a1 : a0;
-      for (int16_t yy = lo; yy <= hi2; ++yy) pxMax(cx, yy, sh);
-    }
-    prevF = yf;
+    gfx.vSpan(cx, prev, yy, sh);
+    prev = yy;
     ph    += phStep;
     seedA += seedStep;
   }
-
 }
 
 // Panel ruler. Everything here is thin strokes, so it draws almost no current.
@@ -6652,66 +7023,24 @@ static void drawTurboBadgeBig(int16_t cy) {
 // =============================================================================
 // MOTION LAYER (v1.08)
 // =============================================================================
-// Everything that moves on screen goes through here, so motion is TIME-based,
-// not frame-based: a value glides toward its target with a fixed time constant
-// no matter how many frames the loop manages. Three pieces:
+// v1.24: what is left of it is the page transitions. v1.08 also glided every
+// fader, cursor and meter toward its target (a time-constant follower) and
+// drew each moving edge with a partial grey pixel; both went with the
+// Monomachine grid - the machine's own screen snaps, and so does this one.
 //
-//   Smooth       exponential follower. v chases target, tau = time to cover
-//                63% of the distance. Frame-rate independent. Reports "still
-//                moving" so a static page keeps drawing until it has settled,
-//                then goes back to costing nothing.
-//   *AA draws    sub-pixel fills. The partial pixel at the moving edge of a bar
-//                is drawn in a grey proportional to how much of it is covered,
-//                so a bar grows continuously instead of in whole-pixel steps.
-//                On a 16-level panel this is what makes motion look analogue.
 //   transitions  page change = the pages slide sideways, subpage = crossfade.
 //                Composited in panel space: one logical column is one 128-byte
-//                panel row, so a slide is 64 memcpy's per frame.
+//                panel row, so a slide is 64 memcpy's per frame. The default
+//                for both is CUT (SET > TRANSITION).
 static float g_dt             = 1.0f / 60.0f;  // seconds, set per rendered frame
 static bool  g_motionBusy     = false;         // something was moving last frame
 static bool  g_motionBusyNext = false;
 
-struct Smooth {
-  float v = 0.0f;
-  bool  init = false;
-  float step(float target, float tau) {
-    if (!init) { v = target; init = true; return v; }
-    const float a = 1.0f - expf(-g_dt / tau);
-    v += (target - v) * a;
-    if (fabsf(target - v) < 0.02f) v = target;
-    else g_motionBusyNext = true;
-    return v;
-  }
-  void reset() { init = false; }
-};
-
 static inline float mEaseOutCubic(float t) { const float u = 1.0f - t; return 1.0f - u * u * u; }
 
-// Motion time constants. Short enough to feel directly connected to the knob,
-// long enough to turn a 7-step coarse jump or a bursty CC stream into a glide.
-static const float MT_FADER  = 0.055f;
-static const float MT_CURSOR = 0.045f;
-static const float MT_BAR    = 0.060f;
+// Transition lengths.
 static const uint32_t MT_SLIDE_MS = 160;
 static const uint32_t MT_FADE_MS  = 113;
-
-// Vertical fader fill with an anti-aliased top edge. Same geometry as
-// Gfx::faderFill (wall 2 | gap 2 | bar 5 | gap 2 | wall 2, track a+7..b-7).
-static void faderFillAA(int16_t x0, int16_t a, int16_t b, float v) {
-  const int16_t iT = (int16_t)(a + 7), iB = (int16_t)(b - 7);
-  const int16_t span = (int16_t)(iB - iT + 1);
-  if (span <= 0) return;
-  if (v < 0.0f)   v = 0.0f;
-  if (v > 127.0f) v = 127.0f;
-  float hf = (float)span * v / 127.0f;
-  if (v > 0.0f && hf < 1.0f) hf = 1.0f;            // non-zero is never invisible
-  const int16_t full = (int16_t)hf;
-  const float frac = hf - (float)full;
-  if (full > 0) gfx.fillRect((int16_t)(x0 + 4), (int16_t)(iB - full + 1), 5, full, SH_ON);
-  const uint8_t edge = (uint8_t)(frac * (float)SH_ON + 0.5f);
-  if (edge && full < span)
-    for (int16_t i = 0; i < 5; ++i) gfx.px((int16_t)(x0 + 4 + i), (int16_t)(iB - full), edge);
-}
 
 // ---- page transitions ------------------------------------------------------
 static uint8_t  g_prevFb[PANEL_W * PANEL_H / 2];   // the page we are leaving
@@ -6723,7 +7052,8 @@ static int8_t   g_transKind  = 0;   // 0 none, +1/-1 slide, 2 fade, 3 wipe,
 enum TransStyle : uint8_t { TS_SLIDE = 0, TS_WIPE, TS_DISSOLVE, TS_FLASH, TS_CUT, TS_COUNT };
 static const char* const kTransName[TS_COUNT] = {"SLIDE", "WIPE", "DISSOLVE", "FLASH", "CUT"};
 static uint8_t uiTransStyle = TS_CUT;        // main page <-> main page: instant
-static uint8_t uiTransSub   = TS_DISSOLVE;   // into, out of, between sub-pages
+static uint8_t uiTransSub   = TS_CUT;        // v1.24: a cut, as on the machine -
+                                             //   DISSOLVE is still in SET > TRANSITION
 static uint32_t g_transStart = 0, g_transDur = 1;
 
 static inline int transRowOf(int x) {              // logical column -> panel row
@@ -6836,95 +7166,81 @@ static void transCompose(uint32_t nowUs) {
 // -----------------------------------------------------------------------------
 // PAGE 1 — LFO OVERVIEW
 // -----------------------------------------------------------------------------
-// A header, six strips, a soft-key line. Each strip is one line of bold text —
-// number, destination, live value — over a scope with a playhead. The selected
-// LFO is marked by a solid bar down the left edge of its strip and by its text
-// running at full brightness while the others sit one step down; a 1px
-// selection frame, which is what the old page used, is the first thing to
-// vanish at arm's length on a panel this size.
-// A 2-px meter on a faint dotted track, with an anti-aliased leading edge.
-static void lfoHairMeter(int16_t x, int16_t y, int16_t w, float v, uint8_t sh) {
-  gfx.dotHLine(x, (int16_t)(y + 1), w, SH_FAINT, 2);
-  if (v < 0.0f)   v = 0.0f;
-  if (v > 127.0f) v = 127.0f;
-  const float f = (float)w * v / 127.0f;
-  const int16_t full = (int16_t)f;
-  const uint8_t edge = (uint8_t)((f - (float)full) * (float)sh + 0.5f);
-  if (full) gfx.fillRect(x, y, full, 2, sh);
-  if (edge && full < w) gfx.vLine((int16_t)(x + full), y, 2, edge);
-}
-
+// v1.24 - SIX STRIPS ON THE GRID.
+//   y  0..9    header: LFO and the tempo, rule at 9
+//   y 11..18   RUN / STOP (3x5) and the turbo badge, rule at 19
+//   y 20..241  six strips of 37px, each ending in a G_DARK rule:
+//     +0..8    the title line - number (5x7 MID), destination (5x7 LIGHT),
+//              value (5x7 WHITE, right). The selected LFO is the focus
+//              block, the full width. A bypassed LFO is all MID, "OFF".
+//     +10..30  its scope: 1px frame (G_MID in focus, G_DARK otherwise)
+//     +32..33  depth (x 0..29) and amount (x 34..63), 2px bars
+// The v1.10 page marked the selection with a gliding 2px bar, a chip for the
+// selected name and a dimmer text for the rest; one block says it alone.
 static void drawOverview(bool running, const char* statLbl, uint32_t bpmX100) {
   gfx.clear();
   const int16_t W = UI_W;
   char b[12], v[8];
 
-  // Header: identity left, tempo right. The turbo badge keeps its own corner on
-  // the line below so it never fights the BPM for the same pixels.
   { bpmStr(bpmX100, b);
     uint8_t k = 0; while (b[k] && b[k] != '.') k++;
     b[k] = 0;                                   // integer BPM; the decimal is noise
     stHeader("LFO", b); }
-  gfx.text35(0, 11, running ? "RUN" : "STOP", running ? SH_ON : SH_DIM);
-  if (statLbl && *statLbl) gfx.text35(22, 11, statLbl, SH_MID);
-  drawTurboBadge((int16_t)(W - 1), 10);
+  gfx.text35(0, 12, running ? "RUN" : "STOP", running ? G_WHITE : G_MID);
+  if (statLbl && *statLbl) gfx.text35(22, 12, statLbl, G_LIGHT);
+  drawTurboBadge((int16_t)(W - 1), 11);
+  gfx.hLine(0, 19, W, G_DARK);
 
-  // Six items. Selected is a filled chip, unselected an outlined box - the whole
-  // selection language, no caret and no brightness step to squint at.
-  // 19 + 6*37 = 241, clear of the footer rule at 246. At 38 the sixth row's
-  // scope was drawn past the bottom of the panel and simply vanished.
-  const int16_t top = 19, rowH = 37;
+  const int16_t top = 20, rowH = 37;
   for (uint8_t i = 0; i < LFO_COUNT; ++i) {
     const int16_t y = (int16_t)(top + i * rowH);
     const LfoParams& p = lfo.p[i];
-    const bool sel = (ui.sel == i);
-
-    uint8_t k = 0;
-    b[k++] = (char)('1' + i); b[k++] = ' ';
+    uint8_t nsh = G_MID, dsh = p.enabled ? G_LIGHT : G_MID, vsh = p.enabled ? G_WHITE : G_MID;
+    if (ui.sel == i) nsh = dsh = vsh = stFocus(0, y, W, ST_ROW);
+    const char nb[2] = {(char)('1' + i), 0};
+    gfx.text(1, (int16_t)(y + 1), nb, nsh);
     const char* nm = destName(i);
-    while (*nm && k < 7) b[k++] = *nm++;
-    b[k] = 0;
-    // v1.10: only the SELECTED strip wears the chip. Six filled chips made the
-    // selection one white block among six; now the selected label is the one
-    // solid shape on the page and the rest are quiet text in the same place.
-    int16_t cw;
-    if (sel) cw = (int16_t)(3 + stChipAuto(3, y, b, true));
-    else   { gfx.text35(5, (int16_t)(y + 1), b, p.enabled ? SH_MID : SH_DIM);
-             cw = (int16_t)(5 + gfx.width35(b) + 2); }
+    gfx.text(9, (int16_t)(y + 1), nm, dsh);
+    if (!p.enabled) strcpy(v, "OFF");
+    else paramFormat(p.page, p.dest, p.track, lfo.s[i].value, v);
+    stText((int16_t)(W - 1), (int16_t)(y + 1),
+           (int16_t)(W - 13 - gfx.textWidth(nm)), v, vsh, 2);
 
-    // OFF is stated, not implied by a dim shade that vanishes across a room.
-    if (!p.enabled) gfx.text35((int16_t)(cw + 3), (int16_t)(y + 1), "OFF", SH_DIM);
-    paramFormat(p.page, p.dest, p.track, lfo.s[i].value, v);
-    gfx.text35R((int16_t)(W - 2), (int16_t)(y + 1), v,
-                !p.enabled ? SH_DIM : (sel ? SH_ON : SH_MID));
-
-    drawWaveBox(0, (int16_t)(y + 8), W, 22, i,
-                lfo.driving(i), (sel && p.enabled) ? SH_ON : SH_DIM);
-    // Depth and amount - the two things E3 and E4 hold - as a pair of hairline
-    // meters on their own line. Two numbers would be two more things to decode;
-    // two lengths are a glance. v1.10: 2 px on a dotted track instead of 4-px
-    // outlined slabs, which at full depth were the brightest thing on the page.
-    static Smooth smDepth[LFO_COUNT], smAmt[LFO_COUNT];
-    const uint8_t mSh = !p.enabled ? SH_DIM : (sel ? SH_ON : SH_MID);
-    lfoHairMeter(0, (int16_t)(y + 31), 29, smDepth[i].step((float)p.depth, MT_BAR), mSh);
-    lfoHairMeter(33, (int16_t)(y + 31), (int16_t)(W - 33), smAmt[i].step((float)p.amount, MT_BAR), mSh);
+    drawWaveBox(0, (int16_t)(y + 10), W, 21, i, lfo.driving(i),
+                (ui.sel == i && p.enabled) ? G_WHITE : G_MID);
+    const uint8_t msh = p.enabled ? G_WHITE : G_MID;
+    stBarH(0,  (int16_t)(y + 32), 30, 2, p.depth,  127, BAR_FILL, msh);
+    stBarH(34, (int16_t)(y + 32), 30, 2, p.amount, 127, BAR_FILL, msh);
+    if (i + 1 < LFO_COUNT) gfx.hLine(0, (int16_t)(y + rowH - 1), W, G_DARK);
   }
-  // The selection bar glides between strips instead of jumping.
-  { static Smooth smSel;
-    const uint8_t si = (ui.sel < LFO_COUNT) ? ui.sel : 0;
-    const float sy = smSel.step((float)(top + si * rowH), MT_CURSOR);
-    gfx.fillRect(0, (int16_t)(sy + 0.5f), 2, ST_CHIP_H, SH_ON); }
-  stFooter("1 SEL", "3D 4A");
+  stFooter("E3 DPTH", "E4 AMT");
 }
 
 // -----------------------------------------------------------------------------
 // PAGE 2 — LFO EDIT
 // -----------------------------------------------------------------------------
-// Header, machine name, the eight Monomachine LFO parameters one per row, the
-// trig-step grid, and a large scope. Row pitch went from 9 to 11 and the label
-// chips became plain text with a cursor caret, which is what bought the extra
-// air; the scope grew from 45 rows to 48 with the range printed under it
-// instead of floating over its corners.
+// v1.24 - THE MONOMACHINE'S LFO PAGE. The eight LFO parameters in the order
+// the machine lists them, as a 2 x 4 grid of cells. E1 walks the cells in
+// reading order; E2 changes the one in focus.
+//
+//   y  0..9     header: EDIT and the LFO, rule at 9
+//   y 11..19    track (3x5 MID) and its machine (5x7 LIGHT), rule at 20
+//   y 21..104   the grid: cells x 0..30 and 32..63 either side of a rule at
+//               x 31, 21 tall with a rule under each pair. In a cell:
+//                 +1..7   the name, 3x5 - the focus block, the cell's full
+//                         width, on the selected one
+//                 +10..16 the value, 5x7 WHITE (WAVE adds its shape, LIGHT)
+//                 +18..19 a 2px bar: a block at the entry for PAGE, DEST,
+//                         TRIG, WAVE and MULT; a fill for SPD, INTL, DPTH
+//   y 106..153  the steps: bars/page and the cursor step's probability, then
+//               4 x 4 cells of 14 x 8 on a 16 x 10 pitch. A cell's fill
+//               HEIGHT is its probability; the frame is WHITE on the cursor,
+//               LIGHT on the playing step, MID on an on step, DARK when off.
+//               Steps past an 8-step sequence are a dotted DARK dash.
+//   y 158..215  the scope, 1px frame, the output value knocked out top right
+//   y 219..223  the reachable window: LO and HI either side of a bar - the
+//               window MID on DARK, the output a 1px WHITE line
+//   y 227..235  AMT: label, bar, value
 static void drawEdit(uint32_t absStep16, bool running) {
   gfx.clear();
   const LfoParams& p = lfo.p[ui.sel];
@@ -6935,86 +7251,107 @@ static void drawEdit(uint32_t absStep16, bool running) {
   { b[0] = 'L'; b[1] = (char)('1' + ui.sel); b[2] = 0;
     stHeader("EDIT", b); }
 
-  // Track and machine on one line - an unknown machine says so rather than
-  // lying about a profile we do not have.
-  { uint8_t k = 0;
-    b[k++] = 'T'; b[k++] = (char)('1' + (p.track < 6 ? p.track : 0)); b[k++] = ' ';
-    const char* src = mnmMachineLabel(p.track < 6 ? machineSel[p.track] : 0);
-    while (*src && k < 15) b[k++] = *src++;
-    b[k] = 0;
-    gfx.text35(0, 11, b, SH_MID); }
+  // Track and machine - an unknown machine says so rather than lying about a
+  // profile we do not have.
+  { const uint8_t t = (p.track < 6) ? p.track : 0;
+    b[0] = 'T'; b[1] = (char)('1' + t); b[2] = 0;
+    gfx.text35(0, 13, b, G_MID);
+    stText(10, 12, (int16_t)(W - 10), mnmMachineLabel(machineSel[t]), G_LIGHT, 0); }
+  gfx.hLine(0, 20, W, G_DARK);
 
-  // ---- the eight parameters, one chip-labelled row each --------------------
-  static const char* const kRowLabels[8] = {
+  // ---- the eight parameters -----------------------------------------------
+  static const char* const kLbl[8] = {
       "PAGE", "DEST", "TRIG", "WAVE", "MULT", "SPD", "INTL", "DPTH"};
-  char spdB[4], intlB[4], dpB[4];
-  u8s3(p.spd, spdB); u8s3(p.intl, intlB); u8s3(p.depth, dpB);
+  char nb[3][4];
+  u8s(p.spd, nb[0]); u8s(p.intl, nb[1]); u8s(p.depth, nb[2]);
   const char* vals[8] = {kMnmPages[p.page].name, destName(ui.sel),
                          kTrigNames[p.trig], kWaveShort[p.wave],
-                         kMultNames[p.mult], spdB, intlB, dpB};
+                         kMultNames[p.mult], nb[0], nb[1], nb[2]};
+  const int16_t bv[8] = {p.page, p.dest, p.trig, p.wave, p.mult, p.spd, p.intl, p.depth};
+  const int16_t bm[8] = {PAGE_COUNT - 1, (int16_t)(kMnmPages[p.page].count - 1),
+                         TRIG_COUNT - 1, WAVE_COUNT - 1, LFO_MULT_MAX, 127, 127, 127};
+  const int16_t GY = 21, CH = 21;
+  gfx.vLine(31, GY, (int16_t)(4 * CH - 1), G_DARK);
   for (uint8_t r = 0; r < 8; ++r) {
-    const int16_t y = (int16_t)(19 + r * ST_ROW);
-    stRow(y, kRowLabels[r], vals[r], ui.paramRow == r);
-    // The WAVE row carries a thumbnail between label and value: "SAW" and "ISW"
-    // are three letters apart, the picture is instant.
-    if (r == 3) waveGlyph(30, (int16_t)(y + 1), p.wave, SH_MID);
+    const int16_t x0 = (r & 1) ? 32 : 0, cw = (r & 1) ? 32 : 31;
+    const int16_t y  = (int16_t)(GY + (r >> 1) * CH);
+    const uint8_t lsh = (ui.paramRow == r) ? stFocus(x0, (int16_t)(y + 1), cw, ST_CHIP_H)
+                                           : G_MID;
+    gfx.text35((int16_t)(x0 + 2), (int16_t)(y + 2), kLbl[r], lsh);
+    stText((int16_t)(x0 + 2), (int16_t)(y + 10), (int16_t)(cw - 4 - (r == 3 ? 10 : 0)),
+           vals[r], G_WHITE, 0);
+    // The WAVE cell carries the shape beside its name: "SAW" and "ISW" are
+    // three letters apart, the picture is instant.
+    if (r == 3) waveGlyph((int16_t)(x0 + cw - 10), (int16_t)(y + 11), p.wave, G_LIGHT);
+    stBarH((int16_t)(x0 + 2), (int16_t)(y + 18), (int16_t)(cw - 4), 2, bv[r], bm[r],
+           r < 5 ? BAR_THUMB : BAR_FILL, G_WHITE);
+    if (r & 1) gfx.hLine(0, (int16_t)(y + CH - 1), W, G_DARK);
   }
 
   // ---- the probability grid ------------------------------------------------
   // Spec: each step is one of nine activation levels, so a cell is a fill
-  // HEIGHT, not on/off. Nine heights read as a shape - you can see a pattern
-  // thinning toward the end of a bar without decoding sixteen numbers.
+  // HEIGHT, not on/off - a pattern thinning toward the end of a bar is a shape.
   const uint8_t sc = (p.stepCount == 8) ? 8 : 16;
   { b[0] = 'B'; b[1] = (char)('0' + p.bars); b[2] = '/';
     b[3] = (char)('1' + ui.stepPage); b[4] = 0;
+    gfx.text35(0, 108, "STEP", G_MID);
+    gfx.text35(19, 108, b, G_LIGHT);
     const LfoStep& cs = p.steps[(ui.stepPage * sc + (ui.stepCur % sc)) % LFO_STEPS];
-    if (!cs.on) { v[0]='O'; v[1]='F'; v[2]='F'; v[3]=0; }
-    else { u8s3(kStepProbPct[cs.prob < PROB_COUNT ? cs.prob : (uint8_t)PROB_100], v);
-           v[3] = '%'; v[4] = 0; }
-    stRow(93, b, v, false); }
+    if (!cs.on) strcpy(v, "OFF");
+    else { u8s(kStepProbPct[cs.prob < PROB_COUNT ? cs.prob : (uint8_t)PROB_100], v);
+           strcat(v, "%"); }
+    stText(W, 107, 30, v, cs.on ? G_WHITE : G_MID, 2); }
 
-  const int16_t SQ = 12, GAP = (int16_t)((W - 4 * SQ) / 5);
-  const int16_t X0 = GAP, Y0 = 104;
   const uint16_t seqLen = (uint16_t)p.bars * sc;
   const uint16_t live = seqLen ? (uint16_t)(absStep16 % seqLen) : 0;
   for (uint8_t k = 0; k < 16; ++k) {
-    const int16_t sx = (int16_t)(X0 + (k % 4) * (SQ + GAP));
-    const int16_t sy = (int16_t)(Y0 + (k / 4) * (SQ + 3));
-    // At stepCount 8 the back half is not part of the sequence. Drawn as an
-    // empty hairline rather than hidden: the page must not appear to lose half
-    // its controls because one parameter changed.
-    if (k >= sc) { gfx.rect(sx, sy, SQ, SQ, SH_FAINT); continue; }
+    const int16_t sx = (int16_t)(1 + (k % 4) * 16), sy = (int16_t)(116 + (k / 4) * 10);
+    // At stepCount 8 the back half is not part of the sequence: a dotted dash
+    // where the cell would be, so the grid keeps its shape.
+    if (k >= sc) { gfx.dotHLine(sx, (int16_t)(sy + 4), 14, G_DARK, 2); continue; }
     const uint8_t idx = (uint8_t)((ui.stepPage * sc + k) % LFO_STEPS);
     const LfoStep& st = p.steps[idx];
-    const bool cur = ((ui.stepCur % sc) == k);
-    const bool isLive = running && ((uint16_t)(ui.stepPage * sc + k) == live);
-    stCell(sx, sy, SQ, st.on ? kStepProbPct[st.prob < PROB_COUNT ? st.prob
-                                                                : (uint8_t)PROB_100] : 0,
-           cur || isLive);
-    if (cur) gfx.rect((int16_t)(sx - 2), (int16_t)(sy - 2),
-                      (int16_t)(SQ + 4), (int16_t)(SQ + 4), SH_MID);
+    uint8_t fr = st.on ? G_MID : G_DARK;
+    if (running && (uint16_t)(ui.stepPage * sc + k) == live) fr = G_LIGHT;
+    if ((ui.stepCur % sc) == k) fr = G_WHITE;
+    gfx.rect(sx, sy, 14, 8, fr);
+    if (st.on) {
+      const uint8_t pct = kStepProbPct[st.prob < PROB_COUNT ? st.prob : (uint8_t)PROB_100];
+      int16_t fh = (int16_t)((6 * pct + 50) / 100);
+      if (fh < 1) fh = 1;
+      gfx.fillRect((int16_t)(sx + 1), (int16_t)(sy + 7 - fh), 12, fh, G_WHITE);
+    }
   }
+  gfx.hLine(0, 156, W, G_DARK);
 
   // ---- scope ---------------------------------------------------------------
-  const int16_t boxY = 172, boxH = 46;
+  const int16_t boxY = 158, boxH = 58;
   drawWaveBox(0, boxY, W, boxH, ui.sel, lfo.driving(ui.sel),
-              p.enabled ? SH_ON : SH_DIM);
-  // The value as the machine would show it: -64..63 for bipolar, a name for a
-  // list (v1.22). `v` is 8 bytes, the formatter's contract.
-  paramFormat(p.page, p.dest, p.track,
-              p.enabled ? s.value : lfo.restValue(ui.sel), v);
-  textRightKnock((int16_t)(W - 2), (int16_t)(boxY + 2), v, SH_ON);
+              p.enabled ? G_WHITE : G_MID);
+  // The value as the machine would show it (v1.22), knocked out of the trace
+  // so a moving line can never run through a digit.
+  paramFormat(p.page, p.dest, p.track, p.enabled ? s.value : lfo.restValue(ui.sel), v);
+  { const int16_t vw = gfx.textWidth(v) <= 40 ? gfx.textWidth(v) : gfx.width35(v);
+    gfx.fillRect((int16_t)(W - 3 - vw), (int16_t)(boxY + 1), (int16_t)(vw + 2), 9, G_BLACK);
+    stText((int16_t)(W - 2), (int16_t)(boxY + 2), 40, v, G_WHITE, 2); }
 
-  // Reachable range, under the box rather than floating over its corners where
-  // the trace crosses it.
-  { u8s3(p.lo, b); gfx.text35(0, 222, b, SH_DIM);
-    u8s3(p.hi, v); gfx.text35R((int16_t)(W - 1), 222, v, SH_DIM);
-    stBar(18, 221, (int16_t)(W - 36), 7, (int32_t)(s.value - p.lo),
-          (int32_t)(p.hi > p.lo ? p.hi - p.lo : 1)); }
-  { u8s3(p.amount, v);
-    stRow(231, "AMT", v, false); }
+  // ---- the reachable window --------------------------------------------------
+  { const int16_t ry = 219;
+    u8s3(p.lo, b); gfx.text35(0, ry, b, G_MID);
+    u8s3(p.hi, v); gfx.text35R(W, ry, v, G_MID);
+    const int16_t bx = 14, bw = 36;
+    const int16_t lo = p.lo <= p.hi ? p.lo : p.hi, hi = p.lo <= p.hi ? p.hi : p.lo;
+    const int16_t xa = (int16_t)(bx + (bw - 1) * lo / 127), xb = (int16_t)(bx + (bw - 1) * hi / 127);
+    gfx.fillRect(bx, ry, bw, 5, G_DARK);
+    gfx.fillRect(xa, (int16_t)(ry + 1), (int16_t)(xb - xa + 1), 3, G_MID);
+    gfx.vLine((int16_t)(bx + (bw - 1) * s.value / 127), ry, 5, G_WHITE); }
 
-  stFooter("1 ROW", "4 PROB");
+  // ---- amount --------------------------------------------------------------
+  { u8s(p.amount, v);
+    stRow(227, "AMT", v, false);
+    stBarH(18, 230, 26, 3, p.amount, 127, BAR_FILL, G_WHITE); }
+
+  stFooter("E2 VAL", "E4 PROB");
 }
 
 // -----------------------------------------------------------------------------
@@ -7028,6 +7365,22 @@ static void drawEdit(uint32_t absStep16, bool running) {
 // once; what note the bass is actually playing is a thing you read constantly,
 // and it is the only way to tell from the box whether `gen k 36` put the line
 // where you wanted it. The encoder map lives in the file header and in `?`.
+// v1.24 - on the grid:
+//   y  0..9    header: PAT and the genre
+//   y 11..17   PLAY / STOP (5x7) and the tempo, rule at 19
+//   y 20..28   KEY row
+//   y 30..38   the progression: four 15px cells on 1px rules, the bar being
+//              viewed is the focus block
+//   y 41..47   that bar's chord tones, 5x7 LIGHT; rule at 49
+//   y 51..103  six tracks x 16 steps: the role label (focus block on the
+//              cursor track, struck through when muted), a 2x5 WHITE bar per
+//              note (2x2 for a ghost, broken for a ratchet), a WHITE dot under
+//              an accent, a LIGHT one under a lock, a DARK dot for a rest, and
+//              a 1px LIGHT playhead; rule at 105
+//   y 106..126 the whole pattern in miniature; rule at 129
+//   y 130..138 bar / seed row; rule at 140
+//   y 143..    PLAYING: what each track sounds right now - the role WHITE
+//              when it plays, its note in 5x7 and its velocity as a bar
 static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
   gfx.clear();
   const int16_t W = UI_W;
@@ -7035,11 +7388,11 @@ static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
 
   stHeader("PAT", kPatGenreShort[pat.genre]);
 
-  // Engine state as an item, so ON and OFF are different SHAPES rather than two
-  // shades of the same word - the one distinction that survives a dim panel.
-  stChipAuto(0, 11, pat.engineOn ? "PLAY" : "STOP", pat.engineOn);
-  { bpmStr(bpmX100, b);
-    gfx.text35R((int16_t)(W - 2), 12, b, running ? SH_ON : SH_DIM); }
+  // Engine state and tempo. A state, not a focus: PLAY is WHITE, STOP MID.
+  gfx.text(0, 11, pat.engineOn ? "PLAY" : "STOP", pat.engineOn ? G_WHITE : G_MID);
+  bpmStr(bpmX100, b);
+  gfx.textRight(W, 11, b, running ? G_WHITE : G_MID);
+  gfx.hLine(0, 19, W, G_DARK);
 
   // Key and scale - the line you check before you play a note.
   { char nn[6]; patNoteName(pat.root, nn);
@@ -7049,18 +7402,20 @@ static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
     const char* sc2 = kPatScaleName[pat.scale];
     while (*sc2 && k2 < 14) b[k2++] = *sc2++;
     b[k2] = 0;
-    stRow(21, "KEY", b, false); }
+    stRow(20, "KEY", b, false); }
 
-  // Four-bar progression as one segmented strip. Exactly 16px a cell: "VII" is
-  // 11px of glyph plus the chip's 5px of padding, so anything narrower clipped
-  // the widest numeral in the set - which is the one you most need to read.
+  // The four-bar progression: one cell per bar on 1px rules, the bar the grid
+  // shows is the focus block. "VII" and "iii" drop to 3x5 to fit their cell.
   { static const char* const kRoman[7] = {"i","ii","iii","iv","v","VI","VII"};
     const ChordProg& cp = kProg[pat.genre];
     for (uint8_t bar = 0; bar < 4; ++bar) {
+      const int16_t x0 = (int16_t)(bar * 16);
       const bool live = (bar < pat.bars);
       const int8_t dg = cp.deg[bar % 4];
-      stChip((int16_t)(bar * 16), 31, 16,
-             live ? kRoman[((dg % 7) + 7) % 7] : "-", live && bar == patUiBar);
+      uint8_t sh = live ? G_LIGHT : G_MID;
+      if (live && bar == patUiBar) sh = stFocus(x0, 30, 15, ST_ROW);
+      stText((int16_t)(x0 + 8), 31, 13, live ? kRoman[((dg % 7) + 7) % 7] : "-", sh, 1);
+      if (bar < 3) gfx.vLine((int16_t)(x0 + 15), 30, ST_ROW, G_DARK);
     } }
 
   // Chord tones of the viewed bar - the answer to "did gen k 36 put the line
@@ -7073,11 +7428,12 @@ static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
       if (vo < 3 && k2 < 14) b[k2++] = ' ';
     }
     b[k2] = 0;
-    gfx.text35(0, 41, b, SH_MID); }
+    stText(0, 41, W, b, G_LIGHT, 0); }
+  gfx.hLine(0, 49, W, G_DARK);
 
   // ---- 6-track grid for the viewed bar -------------------------------------
   const char* const* kTrLbl = kRole2[patRoleSet()];   // roles follow the genre
-  const int16_t cellW = 3, rowH = 9, gridY = 50;
+  const int16_t cellW = 3, rowH = 9, gridY = 51;
   const int16_t gridX = (int16_t)(W - 16 * cellW);
   const uint16_t seqLen = (uint16_t)pat.bars * PAT_SPB;
   const uint16_t live   = seqLen ? (uint16_t)(absStep16 % seqLen) : 0;
@@ -7087,10 +7443,11 @@ static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
   for (uint8_t t = 0; t < PAT_TRACKS; ++t) {
     const int16_t y = (int16_t)(gridY + t * rowH);
     const bool on = pat.trackOn[t];
-    // The track name is an item: the one under the cursor is filled, the rest
-    // outlined, and a muted track is struck through.
-    stChip(0, y, 13, kTrLbl[t], patUiTrack == t);
-    if (!on) gfx.line(1, (int16_t)(y + 5), 12, (int16_t)(y + 1), SH_DIM);
+    uint8_t lsh = on ? G_LIGHT : G_MID;
+    if (patUiTrack == t) lsh = stFocus(0, y, 13, ST_CHIP_H);
+    gfx.text35(2, (int16_t)(y + 1), kTrLbl[t], lsh);
+    if (!on) gfx.hLine(1, (int16_t)(y + 3), 11, lsh);          // muted: struck through
+    const uint8_t nsh = on ? G_WHITE : G_MID;
     for (uint8_t k2 = 0; k2 < 16; ++k2) {
       const int16_t cx = (int16_t)(gridX + k2 * cellW);
       const uint16_t idx = (uint16_t)(patUiBar * PAT_SPB + k2);
@@ -7098,37 +7455,33 @@ static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
       const PatStep& st = pat.step[t][idx];
       if (st.on && st.roll >= 2) {
         // A ratchet reads as a broken column - several hits in one cell.
-        for (int16_t yy = 1; yy <= 5; yy += 2)
-          gfx.fillRect(cx, (int16_t)(y + yy), 2, 1, on ? SH_ON : SH_DIM);
+        for (int16_t yy = 1; yy <= 5; yy += 2) gfx.fillRect(cx, (int16_t)(y + yy), 2, 1, nsh);
       } else if (st.on) {
-        gfx.fillRect(cx, (int16_t)(y + 1), 2, st.ghost ? 2 : 5,
-                     on ? SH_ON : SH_DIM);
-        if (st.accent) gfx.px((int16_t)(cx + 1), (int16_t)(y + 7), SH_ON);
+        gfx.fillRect(cx, (int16_t)(y + (st.ghost ? 4 : 1)), 2, st.ghost ? 2 : 5, nsh);
+        if (st.accent) gfx.px((int16_t)(cx + 1), (int16_t)(y + 7), G_WHITE);
+      } else {
+        gfx.px(cx, (int16_t)(y + 3), G_DARK);
       }
-      if (patLockN && patLockAt(t, idx))                // a lock: a dot under it
-        gfx.px(cx, (int16_t)(y + 7), SH_MID);
-      if (!st.on) {
-        gfx.px(cx, (int16_t)(y + 3), SH_FAINT);
-      }
+      if (patLockN && patLockAt(t, idx)) gfx.px(cx, (int16_t)(y + 7), G_LIGHT);
       if (running && liveBar == patUiBar && liveStep == k2)
-        gfx.vLine((int16_t)(cx + 2), y, (int16_t)(rowH - 1), SH_MID);
+        gfx.vLine((int16_t)(cx + 2), y, (int16_t)(rowH - 1), G_LIGHT);
     }
   }
+  gfx.hLine(0, 105, W, G_DARK);
 
   // ---- whole pattern in miniature, one pixel column per step ---------------
-  { const int16_t my = 106;
+  { const int16_t my = 108;
     const uint16_t full = (uint16_t)pat.bars * PAT_SPB;
     for (uint8_t t = 0; t < PAT_TRACKS; ++t)
-      for (uint16_t k2 = 0; k2 < full && k2 < (uint16_t)W; ++k2) {
-        if (!pat.step[t][k2].on) continue;
-        gfx.vLine((int16_t)k2, (int16_t)(my + t * 3), 2,
-                  pat.trackOn[t] ? SH_ON : SH_DIM);
-      }
+      for (uint16_t k2 = 0; k2 < full && k2 < (uint16_t)W; ++k2)
+        if (pat.step[t][k2].on)
+          gfx.vLine((int16_t)k2, (int16_t)(my + t * 3), 2, pat.trackOn[t] ? G_WHITE : G_MID);
     if (running && full)
-      gfx.vLine((int16_t)(absStep16 % full), (int16_t)(my - 2),
-                (int16_t)(PAT_TRACKS * 3 + 4), SH_MID);
+      gfx.vLine((int16_t)(absStep16 % full), (int16_t)(my - 1),
+                (int16_t)(PAT_TRACKS * 3 + 1), G_LIGHT);
     for (uint8_t bar = 1; bar < pat.bars; ++bar)
-      gfx.px((int16_t)(bar * PAT_SPB), (int16_t)(my + PAT_TRACKS * 3 + 1), SH_MID); }
+      gfx.px((int16_t)(bar * PAT_SPB), (int16_t)(my + PAT_TRACKS * 3 + 1), G_MID); }
+  gfx.hLine(0, 129, W, G_DARK);
 
   // ---- bar / seed ----------------------------------------------------------
   { b[0] = 'B'; b[1] = (char)('1' + patUiBar); b[2] = '/';
@@ -7139,31 +7492,30 @@ static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
     uint8_t k2 = 0;
     while (n && k2 < 5) v[k2++] = t2[--n];     // low digits are the ones that vary
     v[k2] = 0;
-    stRow(128, b, v, false); }
+    stRow(130, b, v, false); }
+  gfx.hLine(0, 140, W, G_DARK);
 
   // ---- live read-out: what each track is actually sounding -----------------
-  gfx.hLine(0, 139, W, SH_DIM);
-  stChipAuto(0, 141, "PLAYING", true);
+  gfx.text35(0, 143, "PLAYING", G_MID);
   for (uint8_t t = 0; t < PAT_TRACKS; ++t) {
     const int16_t y = (int16_t)(151 + t * 11);
     const bool act = patActive[t].active && pat.trackOn[t];
-    stChip(0, y, 13, kTrLbl[t], act);
+    gfx.text35(2, (int16_t)(y + 1), kTrLbl[t], act ? G_WHITE : G_MID);
     if (act) {
       char nn[6]; patNoteName(patActive[t].note, nn);
-      gfx.text35(16, (int16_t)(y + 1), nn, SH_ON);
-      // Velocity as a bar. A number would be one more thing to decode; six bar
-      // lengths side by side are the mix at a glance.
-      stBar(36, y, (int16_t)(W - 36), 7, patActive[t].vel, 127);
+      gfx.text(16, y, nn, G_WHITE);
+      // Velocity as a bar: six bar lengths side by side are the mix at a glance.
+      stBarH(38, (int16_t)(y + 2), (int16_t)(W - 38), 3, patActive[t].vel, 127, BAR_FILL, G_WHITE);
     } else {
-      gfx.text35(16, (int16_t)(y + 1), "--", SH_FAINT);
+      gfx.text35(16, (int16_t)(y + 1), "--", G_MID);
     }
   }
   // E6 turns the cursor as always; on a scene its PUSH sends the scene, and the
   // footer says so - then confirms for a moment after it has gone out.
   if (patIsScene(pat.genre))
-    stFooter("1 GEN", (millis() - g_sceneSentMs < 1500u && g_sceneSentMs) ? "SENT" : "6 SCN");
+    stFooter("E1 GEN", (millis() - g_sceneSentMs < 1500u && g_sceneSentMs) ? "SENT" : "E6 SCN");
   else
-    stFooter("1 GEN", "6 TRK");
+    stFooter("E1 GEN", "E6 TRK");
 }
 
 
@@ -7181,27 +7533,27 @@ static void drawPattern(uint32_t absStep16, bool running, uint32_t bpmX100) {
 // Your newer mockup does not, so it is off by default.
 #define PERF_SHOW_JOYFIELD 0
 
-// v1.14: one pixel left of the reference render (was 7, 26, 45), on request -
-// the whole PERF page moves with it, meters included.
-static const int16_t kPerfColX[3] = {6, 25, 44};
-
-// FULL-LENGTH CAPSULES. These four numbers are not taste, they are measured:
-// the reference render is 448x1792, exactly 64x256 at 7x, so it decodes back to
-// the real 1-bit grid. Top capsule rows 24..127, bottom 129..231, and the two
-// banks mirror about the centre line with their chamfers a single row apart.
+// v1.24 - THE PERF GRID. The encoders' own layout, 3 x 2, as the cells of one
+// rigid grid (the v1.14 capsules, number chips and triangle cursor are gone):
 //
-// The old 24..93 / 159..228 pair was 70 rows instead of 104 because a 28px
-// TURBO badge lived in the gap. That badge is the same link state the SET page
-// already reports in its LINK block, and it was costing a third of the fader
-// travel on the one page whose entire job is showing fader travel. Set
-// PERF_FULL_FADERS to 0 to put it back (it lives in the config block up top).
-#if PERF_FULL_FADERS
-static const int16_t PERF_TOP_A =  24, PERF_TOP_B = 127;
-static const int16_t PERF_BOT_A = 129, PERF_BOT_B = 231;
-#else
-static const int16_t PERF_TOP_A =  24, PERF_TOP_B =  93;
-static const int16_t PERF_BOT_A = 159, PERF_BOT_B = 228;
-#endif
+//   x  0        joystick X meter             x 63       joystick Y meter
+//   x  2..20    column 1    rule x 21        x 22..41   column 2
+//   x 43..61    column 3    rule x 42
+//   y  0..126   bank 1 (E1-E3)   rule y 127   y 128..255 bank 2 (E4-E6)
+//
+// Each cell, from its top:
+//   +0..6     the name, 4 letters of 3x5 - on the slot the last turn touched,
+//             the focus block, the cell's full width
+//   +9..15    the value, 5x7 WHITE (3x5 when it will not fit); "--" in MID
+//             for a slot nothing is known about
+//   +18..123  a 6 x 106 bar standing up: G_DARK track, WHITE value. Bipolar
+//             parameters fill from the middle, lists show a block at their
+//             entry. Under a running LFO the bar is the live output and a
+//             1px G_LIGHT notch across it marks the centre the knob sets.
+static const int16_t kPerfCellX[3] = {2, 22, 43};
+static const int16_t kPerfCellW[3] = {19, 20, 19};
+static const int16_t PERF_BANK_Y[2] = {0, 128};
+static const int16_t PERF_BAR_Y = 18, PERF_BAR_H = 106, PERF_BAR_W = 6;
 
 // Six live parameters, one per encoder. Labels and defaults match the mockup.
 // The fixed label is gone. Once a destination is editable the label has to come
@@ -7243,8 +7595,8 @@ static void perfValStr(uint8_t i, char* out) {
   }
   else { out[0] = '-'; out[1] = '-'; out[2] = 0; }
 }
-static void perfLabel(uint8_t i, char* out3) {   // out3 needs 4 bytes
-  clipN(paramName(perfSlot[i].page, perfSlot[i].dest, perfSlot[i].track), out3, 3);
+static void perfLabel(uint8_t i, char* out4) {   // out4 needs 5 bytes
+  clipN(paramName(perfSlot[i].page, perfSlot[i].dest, perfSlot[i].track), out4, 4);
 }
 // Point a slot's value at what the kit model believes its parameter holds.
 // Called whenever a slot is re-addressed (page, parameter or track).
@@ -7335,138 +7687,64 @@ static void applyMachine(uint8_t t, uint8_t id) {
   uiTouch();
 }
 
-// v1.13: joystick meter, redrawn to the user's own pixel design (PERF mockup
-// 24.png). One pixel wide, on a DASHED track - 3 lit, 6 dark - with the axis
-// letter sitting on the split between the fader banks, where the old centre
-// tick was. The fill leaves the letter in both directions: + grows up from
-// yUp, - grows down from yDn, with an anti-aliased leading pixel.
-//
-//   yT .. yUp    the + half   (row 31 .. 120, 90 rows)
-//   yUp+6..+10   the letter   (rows 126 .. 130)
-//   yDn .. yB    the - half   (row 136 .. 224, 89 rows)
-static void perfJoyMeter(int16_t x, int16_t yT, int16_t yUp, int16_t yDn, int16_t yB,
-                         float v, const char* label, float alpha) {
-  // v1.14: alpha 0..1 scales every shade, so the whole meter - track, letter
-  // and fill - fades as one. Fully transparent draws nothing at all.
-  const uint8_t on = (uint8_t)((float)SH_ON * alpha + 0.5f);
-  if (!on) return;
-  // Dashes: 3 px long, about 9 apart, spread so each half has one touching
-  // BOTH its ends - the outer end of the track and the letter - exactly as
-  // drawn (11 per half on the full-length capsules).
-  for (uint8_t h = 0; h < 2; ++h) {
-    const int16_t first = h ? yDn : yT;                   // top row of first dash
-    const int16_t last  = (int16_t)(h ? yB - 2 : yUp - 3); // top row of last dash
-    const int16_t span  = (int16_t)(last - first);
-    const int16_t n     = (int16_t)((span + 4) / 9);      // intervals
-    for (int16_t i = 0; i <= n; ++i)
-      gfx.vLine(x, (int16_t)(first + (n ? (span * i + n / 2) / n : 0)), 3, on);
-  }
-  gfx.text35((int16_t)(x - 1), (int16_t)(yUp + 6), label, on);
-
-  // 64 is centre: 63 steps up, 64 down, each scaled to its own half.
-  if (v < 0.0f)   v = 0.0f;
-  if (v > 127.0f) v = 127.0f;
-  if (v > 64.0f) {
-    const float f = (v - 64.0f) / 63.0f * (float)(yUp - yT + 1);
-    const int16_t full = (int16_t)f;
-    const uint8_t edge = (uint8_t)((f - (float)full) * (float)on + 0.5f);
-    if (full) gfx.vLine(x, (int16_t)(yUp - full + 1), full, on);
-    if (edge && yUp - full >= yT) gfx.px(x, (int16_t)(yUp - full), edge);
-  } else if (v < 64.0f) {
-    const float f = (64.0f - v) / 64.0f * (float)(yB - yDn + 1);
-    const int16_t full = (int16_t)f;
-    const uint8_t edge = (uint8_t)((f - (float)full) * (float)on + 0.5f);
-    if (full) gfx.vLine(x, yDn, full, on);
-    if (edge && yDn + full <= yB) gfx.px(x, (int16_t)(yDn + full), edge);
-  }
+// The joystick, one pixel wide at each edge: X at x 0, Y at x 63, centred on
+// the bank rule (y 127) - the stick's rest. A G_DARK track and the deflection
+// in WHITE from the centre, up for + and down for -. (v1.13's dashed tracks,
+// letters and anti-aliased tip gave way to the grid; the meters still appear
+// only while the stick is in use, and now appear and go at once.)
+static void perfJoyMeter(int16_t x, uint8_t v) {
+  stBarV(x, 0, 1, 256, v, 127, BAR_CENTRE, G_WHITE);
 }
 
-// One capsule and its value read-out. Under a running LFO the fill and the
-// number are the LFO's live output - what the machine is actually being sent -
-// drawn unsmoothed, because the LFO's motion IS the thing to see. Otherwise the
-// knob's own value, glided as before.
-static void perfDrawCapsule(uint8_t sl, int16_t x0, int16_t a, int16_t b, int16_t valY) {
-  static Smooth smFader[6];
-  const int16_t cx = (int16_t)(x0 + Gfx::FW / 2);
-  char vb[8];
-  gfx.faderShell(x0, a, b);
-  // A list parameter fills the capsule across ITS range (v1.22): SID WAVE's
-  // five entries span the whole fader, not the bottom four percent of it.
+// One cell - see the grid above.
+static void perfDrawCell(uint8_t sl, uint8_t col, int16_t y0) {
   const PerfSlot& ps = perfSlot[sl];
-  const uint8_t vmax = paramRawMax(ps.page, ps.dest, ps.track);
-  const float   fs   = vmax ? 127.0f / (float)vmax : 1.0f;
+  const int16_t x0 = kPerfCellX[col], w = kPerfCellW[col];
+  const int16_t cx = (int16_t)(x0 + w / 2);
+  char lb[6], vb[8];
+  perfLabel(sl, lb);
+  const uint8_t lsh = (perfCursor == sl) ? stFocus(x0, y0, w, ST_CHIP_H) : G_MID;
+  gfx.text35Centre(cx, (int16_t)(y0 + 1), lb, lsh);
+
+  const int16_t bx = (int16_t)(x0 + (w - PERF_BAR_W) / 2), by = (int16_t)(y0 + PERF_BAR_Y);
   const int8_t li = perfLfoFor(sl);
   if (li >= 0) {
+    // Under a running LFO: what the machine is actually being sent, with the
+    // centre the knob sets as a notch across the bar.
     const uint8_t live = lfo.s[li].value;
-    faderFillAA(x0, a, b, (float)live * fs);
-    smFader[sl].v = (float)live * fs; smFader[sl].init = true;   // no jump on release
-    paramFormat(perfSlot[sl].page, perfSlot[sl].dest, perfSlot[sl].track, live, vb);
+    paramFormat(ps.page, ps.dest, ps.track, live, vb);
     vb[4] = 0;
-    gfx.text35Centre(cx, valY, vb, SH_ON);
+    stText(cx, (int16_t)(y0 + 9), (int16_t)(w - 1), vb, G_WHITE, 1);
+    stParamBar(bx, by, PERF_BAR_W, PERF_BAR_H, true, ps.page, ps.dest, ps.track, live, G_WHITE);
+    const int16_t ty = (int16_t)(by + PERF_BAR_H - 1 -
+        stParamPos(PERF_BAR_H, ps.page, ps.dest, ps.track, lfo.restValue((uint8_t)li)));
+    gfx.hLine((int16_t)(bx - 2), ty, (int16_t)(PERF_BAR_W + 4), G_LIGHT);
     return;
   }
-  // An empty shell is the honest picture of a slot we have no value for.
-  // (And a slot that becomes known snaps to its value rather than sweeping
-  // up from zero, which would show a movement that never happened.)
-  if (perfSlot[sl].known)
-    faderFillAA(x0, a, b, smFader[sl].step((float)perfSlot[sl].value * fs, MT_FADER));
-  else smFader[sl].reset();
+  // An empty track is the honest picture of a slot we have no value for.
   perfValStr(sl, vb);
-  gfx.text35Centre(cx, valY, vb, perfSlot[sl].known ? SH_ON : SH_DIM);
+  stText(cx, (int16_t)(y0 + 9), (int16_t)(w - 1), vb, ps.known ? G_WHITE : G_MID, 1);
+  if (ps.known)
+    stParamBar(bx, by, PERF_BAR_W, PERF_BAR_H, true, ps.page, ps.dest, ps.track, ps.value, G_WHITE);
+  else
+    gfx.fillRect(bx, by, PERF_BAR_W, PERF_BAR_H, G_DARK);
 }
 
 static void drawPerform(uint32_t step16, bool running, uint32_t bpmX100) {
   (void)step16; (void)running; (void)bpmX100;
   gfx.clear();
+  gfx.vLine(21, 0, 256, G_DARK);
+  gfx.vLine(42, 0, 256, G_DARK);
+  gfx.hLine(1, 127, 62, G_DARK);
   for (uint8_t c = 0; c < 3; ++c) {
-    const int16_t x0 = kPerfColX[c], cx = (int16_t)(x0 + Gfx::FW / 2);
-
-    // Explicitly 3x5, NOT the switchable font. The column is 13 pixels wide;
-    // a three-letter label at 5x7 is 17 and collides with its neighbour, so on
-    // this page the font switch is not a legible alternative, it is broken
-    // output. Pages whose width is set by a graphic rather than by text cannot
-    // reflow, and pretending otherwise would just ship an overlapping mess.
-    gfx.numChip((int16_t)(x0 + 2), 2, 9, (char)('1' + c));
-    char lb[4]; perfLabel(c, lb);
-    gfx.text35Centre(cx, 12, lb, SH_ON);
-    perfDrawCapsule(c, x0, PERF_TOP_A, PERF_TOP_B, 18);
-    perfDrawCapsule((uint8_t)(c + 3), x0, PERF_BOT_A, PERF_BOT_B, 239);
-    perfLabel((uint8_t)(c + 3), lb);
-    gfx.text35Centre(cx, 233, lb, SH_ON);
-    gfx.numChip((int16_t)(x0 + 2), 245, 9, (char)('4' + c));
-
+    perfDrawCell(c, c, PERF_BANK_Y[0]);
+    perfDrawCell((uint8_t)(c + 3), c, PERF_BANK_Y[1]);
   }
-  // Cursor glides sideways between columns; a top/bottom change is a jump of
-  // 200 px, so the row switches instantly and only the column slides.
-  { static Smooth smCur;
-    const uint8_t col = (uint8_t)(perfCursor % 3);
-    const float cxv = smCur.step((float)(kPerfColX[col] + 5), MT_CURSOR);
-    if (perfCursor < 3) gfx.triD((int16_t)(cxv + 0.5f), PERF_TOP_A, +1);
-    else                gfx.triD((int16_t)(cxv + 0.5f), (int16_t)(PERF_BOT_B - 4), -1); }
-  // Joystick meters in the side margins (x 0-6 and 58-63 are free beside the
-  // fader columns): X on the left, Y on the right, each lettered on the bank
-  // split - the user's own layout. Only when a joystick is compiled in.
-  if (g_joyUiX != 0xFF) {
-    static Smooth smJx, smJy, smJa;
-    const int16_t yT = (int16_t)(PERF_TOP_A + 7), yB = (int16_t)(PERF_BOT_B - 7);
-    // Quick to appear, slow to leave: the stick answers the hand at once, and
-    // an idle panel settles instead of blinking off.
-    const float a  = smJa.step(g_joyShow ? 1.0f : 0.0f,
-                               g_joyShow ? JOY_FADE_IN_S : JOY_FADE_OUT_S);
-    const float jx = smJx.step((float)g_joyUiX, MT_FADER);
-    const float jy = smJy.step((float)g_joyUiY, MT_FADER);
-    perfJoyMeter(2,  yT, 120, 136, yB, jx, "X", a);   // v1.14: 1 px left, with
-    perfJoyMeter(60, yT, 120, 136, yB, jy, "Y", a);   //   the rest of the page
+  // Only when a joystick is compiled in, and only while it is in use.
+  if (g_joyUiX != 0xFF && g_joyShow) {
+    perfJoyMeter(0,  g_joyUiX);
+    perfJoyMeter(63, g_joyUiY);
   }
-#if PERF_SHOW_JOYFIELD
-  gfx.rect(4, 99, 55, 55, SH_ON);
-  gfx.dotHLine(6, 126, 51, SH_FAINT, 2);
-  gfx.vLine(31, 101, 51, SH_FAINT);
-#elif !PERF_FULL_FADERS
-  // Only reachable with short capsules: with full-length ones there is no band
-  // to put this in, and the SET page's LINK block says the same thing.
-  drawTurboBadgeBig(126);
-#endif
 }
 
 // -----------------------------------------------------------------------------
@@ -7848,68 +8126,65 @@ static void btnPatternPage(uint8_t pressed) {
 //
 // The meter under each row is not decoration: with 57 destinations on one
 // detented knob you need to see roughly where in the list you are.
+// v1.24: six rows of 39px on G_DARK rules, one per slot. The slot E1 has
+// selected is the focus: its first line is the block, the full width.
+//   +0..8    slot number (3x5 MID) and the parameter (5x7 WHITE); "?" at the
+//            right while its value is not known
+//   +11..15  page and track (3x5 LIGHT), the CC it lands on (3x5 MID, right)
+//   +18..24  the value (5x7 WHITE) and its bar from x 26 - or "--" and the
+//            init-kit value, MID: where the first turn will start from
+//   +29..31  where the parameter sits among the 57: a 3px LIGHT block on a
+//            1px G_DARK line
 static void drawPerfDest(uint32_t step16, bool running, uint32_t bpmX100) {
   (void)step16; (void)running; (void)bpmX100;
   gfx.clear();
   const int16_t W = UI_W;
   char b[16];
 
-  { b[0] = 'T'; b[1] = 'R'; b[2] = 'K'; b[3] = (char)('1' + perfSlot[perfCursor].track);
-    b[4] = 0;
+  { b[0] = 'T'; b[1] = (char)('1' + perfSlot[perfCursor].track); b[2] = 0;
     stHeader("DEST", b); }
-  gfx.text35(0, 11, "E1 SCRL E2 DEST", SH_DIM);
 
   const uint16_t total = destCount();
   for (uint8_t i = 0; i < 6; ++i) {
-    const int16_t y = (int16_t)(20 + i * 37);
+    const int16_t y = (int16_t)(ST_BODY_Y + i * 39);
     const PerfSlot& p = perfSlot[i];
-    const bool cur = (perfCursor == i);
-    const uint8_t cc = mnmCC(p.page, p.dest);
+    uint8_t nsh = G_MID, psh = G_WHITE;
+    if (perfCursor == i) nsh = psh = stFocus(0, y, W, ST_ROW);
+    { const char nb[2] = {(char)('1' + i), 0};
+      gfx.text35(2, (int16_t)(y + 2), nb, nsh); }
+    gfx.text(8, (int16_t)(y + 1), paramName(p.page, p.dest, p.track), psh);
+    if (!p.known) gfx.text35R((int16_t)(W - 1), (int16_t)(y + 2), "?", nsh);
 
-    // Row 1: numbered cell, then the destination as an item - filled when this
-    // is the row the encoders are pointed at, outlined when it is not.
-    if (cur) gfx.fillRect(0, y, 2, ST_CHIP_H, SH_ON);
-    { char nb[3] = {(char)('1' + i), 0, 0};
-      stChip(4, y, 8, nb, true); }
-    { uint8_t k = 0;
-      const char* pn = paramName(p.page, p.dest, p.track);
-      while (*pn && k < 6) b[k++] = *pn++;
-      b[k] = 0;
-      stChipAuto(14, y, b, true); }
-    if (!p.known) gfx.text35R((int16_t)(W - 1), (int16_t)(y + 1), "?", SH_DIM);
-
-    // Row 2: which page and track it addresses, and the CC it lands on.
     { uint8_t k = 0;
       const char* pg = kMnmPages[p.page].name;
       while (*pg && k < 4) b[k++] = *pg++;
       b[k++] = ' '; b[k++] = 'T'; b[k++] = (char)('1' + p.track); b[k] = 0;
-      gfx.text35(4, (int16_t)(y + 10), b, SH_MID); }
-    if (cc == 0xFF) { b[0] = '-'; b[1] = '-'; b[2] = 0; }
-    else { b[0] = 'C'; b[1] = 'C'; u8s(cc, b + 2); }
-    gfx.text35R((int16_t)(W - 1), (int16_t)(y + 10), b, cur ? SH_ON : SH_DIM);
+      gfx.text35(0, (int16_t)(y + 11), b, G_LIGHT); }
+    { const uint8_t cc = mnmCC(p.page, p.dest);
+      if (cc == 0xFF) { b[0] = '-'; b[1] = '-'; b[2] = 0; }
+      else { b[0] = 'C'; b[1] = 'C'; u8s(cc, b + 2); }
+      gfx.text35R(W, (int16_t)(y + 11), b, G_MID); }
 
-    // Row 3: where this destination sits in the flat list. With 57 of them on
-    // one detented knob you need to see roughly where you are.
-    stBar(0, (int16_t)(y + 18), W, 6, (int32_t)destIndexOf(p.page, p.dest),
-          (int32_t)(total > 1 ? total - 1 : 1));
-    // Row 4: the value, when there is one we can stand behind - as the
-    // machine shows it (v1.22). Otherwise the init-kit value, marked as such:
-    // it is where the first turn will start from, not something we know.
-    { const uint8_t vmax = paramRawMax(p.page, p.dest, p.track);
-      if (p.known) {
-        paramFormat(p.page, p.dest, p.track, p.value, b);
-        gfx.text35(0, (int16_t)(y + 26), b, SH_ON);
-        stBar(18, (int16_t)(y + 25), (int16_t)(W - 18), 6, p.value, vmax ? vmax : 1);
-      } else {
-        char dv[8];
-        paramFormat(p.page, p.dest, p.track,
-                    paramDefault(p.page, p.dest, p.track), dv);
-        snprintf(b, sizeof b, "-- INIT %s", dv);
-        gfx.text35(0, (int16_t)(y + 26), b, SH_DIM);
-      }
+    if (p.known) {
+      paramFormat(p.page, p.dest, p.track, p.value, b);
+      stText(0, (int16_t)(y + 18), 24, b, G_WHITE, 0);
+      stParamBar(26, (int16_t)(y + 19), (int16_t)(W - 26), 5, false,
+                 p.page, p.dest, p.track, p.value, G_WHITE);
+    } else {
+      char dv[8];
+      paramFormat(p.page, p.dest, p.track, paramDefault(p.page, p.dest, p.track), dv);
+      gfx.text(0, (int16_t)(y + 18), "--", G_MID);
+      snprintf(b, sizeof b, "INIT %s", dv);
+      gfx.text35(16, (int16_t)(y + 19), b, G_MID);
     }
+
+    gfx.hLine(0, (int16_t)(y + 30), W, G_DARK);
+    { const int32_t den = total > 1 ? total - 1 : 1;
+      gfx.fillRect((int16_t)((W - 3) * (int32_t)destIndexOf(p.page, p.dest) / den),
+                   (int16_t)(y + 29), 3, 3, G_LIGHT); }
+    if (i < 5) gfx.hLine(0, (int16_t)(y + 38), W, G_DARK);
   }
-  stFooter("CLICK", "NEXT");
+  stFooter("E2 DEST", "E3 TRK");
 }
 
 // Spec, encoder subpage: "6 Destination / First encoder scroll / second changes
@@ -7970,49 +8245,49 @@ static void joyMaskLabel(uint8_t m, char* out) {
   else             { out[0] = (char)('0' + n); strcpy(out + 1, "TRK"); }
 }
 
-// One axis: letter, parameter, page, CC, and the live value as a bar.
+// One axis, 26px: the axis letter (5x7 MID), the parameter (5x7 WHITE), the
+// CC (3x5 MID, right); the page (3x5 LIGHT); the stick's value (5x7 WHITE)
+// and its bar from the centre - the stick rests at 64, so its bar is bipolar
+// whatever it drives.
 static void drawJoyAxis(int16_t y, const char* axis, uint8_t destIdx, uint8_t v) {
   const int16_t W = UI_W;
   char b[16];
   uint8_t pg = 0, sl = 0;
   const bool ok = destAt(destIdx, &pg, &sl);
-  stChip(4, y, 8, axis, true);
-  { uint8_t k = 0;
-    const char* pn = ok ? mnmParamName(pg, sl) : "----";
-    while (*pn && k < 6) b[k++] = *pn++;
-    b[k] = 0;
-    stChipAuto(14, y, b, true); }
-  { uint8_t k = 0;
-    const char* pn = ok ? kMnmPages[pg].name : "";
-    while (*pn && k < 4) b[k++] = *pn++;
-    b[k] = 0;
-    gfx.text35(4, (int16_t)(y + 10), b, SH_MID); }
+  gfx.text(0, y, axis, G_MID);
+  gfx.text(8, y, ok ? mnmParamName(pg, sl) : "----", G_WHITE);
   const uint8_t cc = ok ? mnmCC(pg, sl) : 0xFF;
   if (cc == 0xFF) { b[0] = '-'; b[1] = '-'; b[2] = 0; }
   else { b[0] = 'C'; b[1] = 'C'; u8s(cc, b + 2); }
-  gfx.text35R((int16_t)(W - 1), (int16_t)(y + 10), b, SH_ON);
-  if (v == 0xFF) { gfx.text35(0, (int16_t)(y + 19), "-- NO STICK", SH_DIM); return; }
+  gfx.text35R(W, (int16_t)(y + 1), b, G_MID);
+  gfx.text35(8, (int16_t)(y + 10), ok ? kMnmPages[pg].name : "", G_LIGHT);
+  if (v == 0xFF) { gfx.text35(0, (int16_t)(y + 19), "NO STICK", G_MID); return; }
   u8s3(v, b);
-  gfx.text35(0, (int16_t)(y + 19), b, SH_ON);
-  stBar(18, (int16_t)(y + 18), (int16_t)(W - 18), 6, v, 127);
+  gfx.text(0, (int16_t)(y + 18), b, G_WHITE);
+  stBarH(20, (int16_t)(y + 19), (int16_t)(W - 20), 5, v, 127, BAR_CENTRE, G_WHITE);
 }
 
-// The stick as a position: dotted centre cross, a hairline crosshair, and a
-// 3x3 mark where they meet. Up is up.
+// The stick as a position: a 1px MID frame, a DARK dotted centre cross, DARK
+// crosshairs through the stick, and a 3x3 WHITE mark where they meet. Up is up.
 static void drawJoyPad(int16_t x0, int16_t y0, int16_t sz, uint8_t vx, uint8_t vy) {
-  gfx.rect(x0, y0, sz, sz, SH_DIM);
+  gfx.rect(x0, y0, sz, sz, G_MID);
   const int16_t cx = (int16_t)(x0 + sz / 2), cy = (int16_t)(y0 + sz / 2);
-  gfx.dotHLine((int16_t)(x0 + 2), cy, (int16_t)(sz - 4), SH_FAINT, 2);
-  for (int16_t yy = (int16_t)(y0 + 2); yy < y0 + sz - 2; yy += 2) gfx.px(cx, yy, SH_FAINT);
+  gfx.dotHLine((int16_t)(x0 + 2), cy, (int16_t)(sz - 4), G_DARK, 2);
+  for (int16_t yy = (int16_t)(y0 + 2); yy < y0 + sz - 2; yy += 2) gfx.px(cx, yy, G_DARK);
   if (vx == 0xFF || vy == 0xFF) return;
   const int16_t in = (int16_t)(sz - 6);                  // mark stays inside
   const int16_t px = (int16_t)(x0 + 3 + (in * vx) / 127);
   const int16_t py = (int16_t)(y0 + 3 + (in * (127 - vy)) / 127);
-  gfx.hLine((int16_t)(x0 + 1), py, (int16_t)(sz - 2), SH_FAINT);
-  gfx.vLine(px, (int16_t)(y0 + 1), (int16_t)(sz - 2), SH_FAINT);
-  gfx.fillRect((int16_t)(px - 1), (int16_t)(py - 1), 3, 3, SH_ON);
+  gfx.hLine((int16_t)(x0 + 1), py, (int16_t)(sz - 2), G_DARK);
+  gfx.vLine(px, (int16_t)(y0 + 1), (int16_t)(sz - 2), G_DARK);
+  gfx.fillRect((int16_t)(px - 1), (int16_t)(py - 1), 3, 3, G_WHITE);
 }
 
+// v1.24: header; X and Y (26px each) on rules; the pad (60 x 60); then the six
+// tracks as a 3 x 2 grid of cells on 1px rules. The tracks under the stick
+// are the blocks - this is a multi-select, so there can be several - and a
+// 2x2 BLACK mark in a block's corner lights for JOY_ACT_MS after that track
+// was actually sent something, so ALL can be seen reaching all six.
 static void drawPerfJoy(uint32_t step16, bool running, uint32_t bpmX100) {
   (void)step16; (void)running; (void)bpmX100;
   gfx.clear();
@@ -8022,44 +8297,42 @@ static void drawPerfJoy(uint32_t step16, bool running, uint32_t bpmX100) {
 
   joyMaskLabel(g_joyMask, b);
   stHeader("JOY", b);
-  gfx.text35(0, 11, "E1 X E2 Y E3 TRK", SH_DIM);
 
-  drawJoyAxis(20, "X", g_joyDestX, g_joyUiX);
-  drawJoyAxis(52, "Y", g_joyDestY, g_joyUiY);
-  drawJoyPad(2, 86, (int16_t)(W - 4), g_joyUiX, g_joyUiY);
+  drawJoyAxis(12, "X", g_joyDestX, g_joyUiX);
+  gfx.hLine(0, 38, W, G_DARK);
+  drawJoyAxis(40, "Y", g_joyDestY, g_joyUiY);
+  gfx.hLine(0, 66, W, G_DARK);
+  drawJoyPad(2, 70, (int16_t)(W - 4), g_joyUiX, g_joyUiY);
+  gfx.hLine(0, 133, W, G_DARK);
 
-  // The six tracks, three by two. Filled = under the stick. The line under a
-  // cell lights for JOY_ACT_MS after that track was actually sent something,
-  // so ALL can be seen reaching all six.
-  gfx.text35(0, 154, "TRACKS", SH_DIM);
+  gfx.text35(0, 136, "TRACKS", G_MID);
   { char cb[6] = {'C', 'H', 0, 0, 0, 0};
     u8s(txChannel, cb + 2);
-    gfx.text35R((int16_t)(W - 1), 154, cb, SH_DIM); }
+    gfx.text35R(W, 136, cb, G_MID); }
+  static const int16_t kCx[3] = {0, 22, 43}, kCw[3] = {21, 20, 21};
+  gfx.hLine(0, 143, W, G_DARK);
+  gfx.vLine(21, 144, 35, G_DARK);
+  gfx.vLine(42, 144, 35, G_DARK);
+  gfx.hLine(0, 161, W, G_DARK);
+  gfx.hLine(0, 179, W, G_DARK);
   for (uint8_t t = 0; t < 6; ++t) {
-    const int16_t cw = (int16_t)((W - 4) / 3);
-    const int16_t x = (int16_t)((t % 3) * (cw + 2));
-    const int16_t y = (int16_t)(163 + (t / 3) * 20);
+    const int16_t x = kCx[t % 3], w = kCw[t % 3];
+    const int16_t y = (int16_t)(144 + (t / 3) * 18);
     const bool on = (g_joyMask & (1u << t)) != 0;
-    char tb[3] = {'T', (char)('1' + t), 0};
+    const uint8_t sh = on ? stFocus(x, y, w, 17) : G_MID;
+    const char tb[3] = {'T', (char)('1' + t), 0};
     char chb[6] = {'C', 'H', 0, 0, 0, 0};
     u8s((uint8_t)(((txChannel - 1 + t) & 0x0F) + 1), chb + 2);
-    if (on) {
-      gfx.fillRect(x, y, cw, 15, SH_ON);
-      gfx.text35Centre((int16_t)(x + cw / 2), (int16_t)(y + 2), tb, SH_OFF);
-      gfx.text35Centre((int16_t)(x + cw / 2), (int16_t)(y + 8), chb, SH_OFF);
-    } else {
-      gfx.rect(x, y, cw, 15, SH_DIM);
-      gfx.text35Centre((int16_t)(x + cw / 2), (int16_t)(y + 2), tb, SH_MID);
-      gfx.text35Centre((int16_t)(x + cw / 2), (int16_t)(y + 8), chb, SH_FAINT);
-    }
+    gfx.textCentre((int16_t)(x + w / 2), (int16_t)(y + 1), tb, sh);
+    gfx.text35Centre((int16_t)(x + w / 2), (int16_t)(y + 10), chb, sh);
     if (on && g_joyActMs[t] && (uint32_t)(nowMs - g_joyActMs[t]) < JOY_ACT_MS)
-      gfx.hLine(x, (int16_t)(y + 16), cw, SH_ON);
+      gfx.fillRect((int16_t)(x + w - 3), (int16_t)(y + 1), 2, 2, G_BLACK);
   }
 
-  gfx.text35(0, 208, "PUSH E1-E6", SH_DIM);
-  gfx.text35(0, 216, "TRACK ON / OFF", SH_DIM);
-  gfx.text35(0, 228, "E3 SOLO .. ALL", SH_DIM);
-  stFooter("CLICK", "NEXT");
+  gfx.text35(0, 186, "PUSH E1-E6", G_MID);
+  gfx.text35(0, 194, "TRACK ON / OFF", G_MID);
+  gfx.text35(0, 206, "E3 SOLO .. ALL", G_MID);
+  stFooter("E1 X E2 Y", "E3 TRK");
 }
 
 static const uint8_t kJoyQuick[7] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x3F};
@@ -8519,14 +8792,18 @@ static void drawWizard(uint32_t nowMs) {
       break;
 
     case WIZ_MACHINE_SELECT:
+      // v1.24: a menu - T1..T6 in 3x5, the machine in 5x7, the track under
+      // E1 the focus block the full width.
       stHeader("MACHINE", "2/3");
-      gfx.text35(0, 11, "E1 TRK E2 MACH", SH_DIM);
+      gfx.text35(0, 12, "E1 TRK E2 MACH", G_MID);
+      gfx.hLine(0, 19, W, G_DARK);
       for (uint8_t t = 0; t < 6; ++t) {
-        const int16_t y = (int16_t)(21 + t * 12);
-        const bool cur = (wizCursor == t);
-        char lb[4] = {'T', (char)('1' + t), 0, 0};
-        stChip(0, y, 13, lb, cur);
-        stChip(15, y, (int16_t)(W - 15), mnmMachineLabel(machineSel[t]), cur);
+        const int16_t y = (int16_t)(21 + t * 11);
+        uint8_t tsh = G_MID, msh = machineSel[t] ? G_WHITE : G_MID;
+        if (wizCursor == t) tsh = msh = stFocus(0, y, W, ST_ROW);
+        const char lb[3] = {'T', (char)('1' + t), 0};
+        gfx.text35(2, (int16_t)(y + 2), lb, tsh);
+        stText(12, (int16_t)(y + 1), (int16_t)(W - 14), mnmMachineLabel(machineSel[t]), msh, 0);
       }
       stFooter("CLICK", "NEXT");
       break;
@@ -8555,7 +8832,7 @@ static void drawWizard(uint32_t nowMs) {
       stRow(34, "BYTES", v, false);
       // Honest about what is and is not implemented, rather than implying the
       // engine placements were decoded when they were not.
-      gfx.text35(0, 50, "PARSE: TODO", SH_FAINT);
+      gfx.text35(0, 50, "PARSE: TODO", G_MID);
       stFooter("CLICK", "SAVE");
       break;
 
@@ -8646,7 +8923,6 @@ static const SetRow kSetRows[] = {
   {SK_HEAD, 0,         "DISPLAY"},
   {SK_VAL,  SI_BRIGHT, "BRIGHT"},
   {SK_VAL,  SI_WIDTH,  "WIDTH"},
-  {SK_VAL,  SI_FONT,   "FONT"},
   {SK_VAL,  SI_STYLE,  "STYLE"},
   {SK_VAL,  SI_INVERT, "INVERT"},
   {SK_HEAD, 0,         "TRANSITION"},
@@ -8716,7 +8992,6 @@ static void setValue(uint8_t id, char* out, uint8_t cap) {
     case SI_TGO:    snprintf(out, cap, "GO"); break;
     case SI_BRIGHT: snprintf(out, cap, "%02X", (unsigned)uiContrast); break;
     case SI_WIDTH:  u8s((uint8_t)UI_W, out); break;
-    case SI_FONT:   snprintf(out, cap, uiFont == UIFONT_3X5 ? "3X5" : "5X7"); break;
     case SI_STYLE:  snprintf(out, cap, uiChipStyle ? "CHIP" : "LINE"); break;
     case SI_INVERT: snprintf(out, cap, uiInvert ? "ON" : "OFF"); break;
     case SI_TRANS:  snprintf(out, cap, "%s", kTransName[uiTransStyle < TS_COUNT ? uiTransStyle : 0]); break;
@@ -8773,8 +9048,6 @@ static void setAdjust(uint8_t id, int8_t d) {
     }
     case SI_WIDTH:  UI_W = addClamp((uint8_t)UI_W, d, 8, 64);
                     g_shadowValid = false; break;
-    case SI_FONT:   uiFont = (uiFont == UIFONT_3X5) ? UIFONT_5X7 : UIFONT_3X5;
-                    g_shadowValid = false; break;
     case SI_STYLE:  uiChipStyle = !uiChipStyle; g_shadowValid = false; break;
     case SI_INVERT: uiSetInvert(!uiInvert); break;
     case SI_TRANS:  uiTransStyle = addClamp(uiTransStyle, d, 0, (uint8_t)(TS_COUNT - 1)); break;
@@ -8813,10 +9086,16 @@ static void setActivate(uint8_t id) {
   }
 }
 
+// v1.24: an Elektron menu. Section heads are 3x5 LIGHT with a G_DARK rule
+// running on to the right edge; rows are the 3x5 label (MID) and the value
+// (WHITE, read-outs LIGHT) at the right, 9px apart; the cursor row is the
+// focus block, the full width but the scroll bar - a 1px G_DARK track at
+// x 63 with a WHITE thumb.
 static void drawSettings(uint32_t step16, bool running, uint32_t bpmX100) {
   (void)step16; (void)running; (void)bpmX100;
   gfx.clear();
   const int16_t W = UI_W;
+  const int16_t RW = (int16_t)(W - 2);          // rows stop short of the scroll bar
 
   stHeader("SET", "CFG");
 
@@ -8835,42 +9114,40 @@ static void drawSettings(uint32_t step16, bool running, uint32_t bpmX100) {
     const SetRow& row = kSetRows[r];
     const int16_t y = (int16_t)(top + k * pitch);
 
-    // A section head spans the full width - the one chip on the page that is
-    // not a control, so it cannot be mistaken for one.
-    if (row.kind == SK_HEAD) { stChip(0, y, W, row.label, true); continue; }
-
-    char v[20]; setValue(row.id, v, sizeof v);
-    // INFO rows are read-outs and never take the cursor's filled treatment,
-    // even when the cursor is parked on one to scroll the block into view.
-    if (row.kind == SK_INFO) {
-      gfx.text35(2, (int16_t)(y + 1), row.label, setCur == r ? SH_ON : SH_DIM);
-      gfx.text35R((int16_t)(W - 1), (int16_t)(y + 1), v, SH_MID);
-      if (setCur == r) gfx.vLine(0, y, ST_CHIP_H, SH_ON);
-    } else {
-      stRow(y, row.label, v, setCur == r);
+    if (row.kind == SK_HEAD) {
+      gfx.text35(0, (int16_t)(y + 2), row.label, G_LIGHT);
+      const int16_t tx = (int16_t)(gfx.width35(row.label) + 3);
+      gfx.hLine(tx, (int16_t)(y + 4), (int16_t)(RW - tx), G_DARK);
+      continue;
     }
+    char v[20]; setValue(row.id, v, sizeof v);
+    uint8_t lsh = G_MID, vsh = (row.kind == SK_INFO) ? G_LIGHT : G_WHITE;
+    if (setCur == r) lsh = vsh = stFocus(0, y, RW, ST_ROW);
+    gfx.text35(2, (int16_t)(y + 2), row.label, lsh);
+    stText((int16_t)(RW - 1), (int16_t)(y + 1),
+           (int16_t)(RW - gfx.width35(row.label) - 7), v, vsh, 2);
   }
 
-  // Scroll position as a hairline on the right - the only cue that there is
-  // more page below the fold, and it never eats a column of text.
+  // Scroll position - the only cue that there is more page below the fold.
   if (SET_ROWS > vis) {
     const int16_t h = (int16_t)((int32_t)(bot - top) * vis / SET_ROWS);
     const int16_t yy = (int16_t)(top + (int32_t)(bot - top) * setTop / SET_ROWS);
-    gfx.vLine((int16_t)(W - 1), yy, h > 3 ? h : 3, SH_FAINT);
+    gfx.vLine((int16_t)(W - 1), top, (int16_t)(bot - top), G_DARK);
+    gfx.vLine((int16_t)(W - 1), yy, h > 3 ? h : 3, G_WHITE);
   }
 
   // A save is the one action here that takes long enough to need saying so.
-  gfx.hLine(0, 221, W, SH_DIM);
+  gfx.hLine(0, 221, W, G_DARK);
   if (Store::busy()) {
     stChipAuto(0, 224, storeMsg, true);
-    stBar(0, 233, W, 7, HalEeprom::progress(), (int32_t)sizeof(PresetP));
+    stBar(0, 234, W, 3, HalEeprom::progress(), (int32_t)sizeof(PresetP));
   } else if (storeMsg[0]) {
     stChipAuto(0, 224, storeMsg, storeOp == ST_ERR);
-    gfx.text35(0, 234, "E1 PUSH = DO", SH_DIM);
+    gfx.text35(0, 235, "E1 PUSH = DO", G_MID);
   } else {
-    gfx.text35(0, 234, "E1 SEL  E6 VAL", SH_DIM);
+    gfx.text35(0, 235, "E1 PUSH = DO", G_MID);
   }
-  stFooter("1 SEL", "6 VAL");
+  stFooter("E1 SEL", "E6 VAL");
 }
 
 static void encSettings(const int8_t* d) {
@@ -9723,7 +10000,6 @@ static void printHelp() {
     "                 joy x <i> | y <i> (destination 0-56) | sweep <s> (dry run)\n"
     "  invert 0 | 1   reverse black and white across the whole OS\n"
     "  style 0 | 1    chip style: 1 inverted blocks, 0 strokes on black\n"
-    "  font 3 | font 5  3x5 mockup font, or 5x7 legible font\n"
     "  boot           replay the startup logo animation\n"
     "  clk i | clk e  internal clock (no MnM needed) or external\n"
     "  bpm <n>        internal tempo\n"
@@ -10121,17 +10397,11 @@ static void handleCommand(const char* c) {
     if (a >= 0 && a < TRIG_COUNT) { lfo.p[0].trig = (uint8_t)a;
       Serial.printf("trig %s\n", kTrigNames[a]); } return; }
   if (isCmd(c, "font")) {
-    const long a2 = parseArg(c, false);
-    if (a2 == 3 || a2 == 5) {
-      uiFont = (a2 == 3) ? UIFONT_3X5 : UIFONT_5X7;
-      uiTouch(); g_shadowValid = false;
-      Serial.printf("ported pages now draw in the %s font\n",
-                    uiFont == UIFONT_3X5 ? "3x5 (mockup-accurate, 16 cols)"
-                                         : "5x7 (legible, 10 cols)");
-    } else {
-      Serial.printf("font is %s.  'font 3' = mockup 3x5, 'font 5' = legible 5x7\n",
-                    uiFont == UIFONT_3X5 ? "3x5" : "5x7");
-    }
+    // v1.24: retired. The Monomachine grid picks the face by role - 5x7 for
+    // values, 3x5 for labels (stText) - so no page reads uiFont any more. The
+    // byte stays in the globals so their layout does not move.
+    Serial.println(F("font: retired in v1.24 - values are 5x7 and labels 3x5 on every\n"
+                     "      page, with 3x5 only where a value will not fit its cell."));
     return; }
   if (isCmd(c, "page")) {
     const long a2 = parseArg(c, false);
@@ -10843,8 +11113,7 @@ static void joyService(uint32_t nowUs) {
   joyTransmit(nowMs, nowUs);
   // v1.14: activity. Off centre, or moved since the last pass, counts; the
   // meters stay up for JOY_HIDE_MS after the last of either. The PERF page is
-  // static, so it is told when the target flips - the fade itself then keeps
-  // the page drawing (Smooth reports motion) until it settles.
+  // static, so it is told when they come and go.
   { static uint32_t lastActiveMs = 0;
     if (joyX.pend != 64 || joyY.pend != 64 || joyX.pend != px || joyY.pend != py)
       lastActiveMs = nowMs ? nowMs : 1;

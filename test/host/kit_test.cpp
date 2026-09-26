@@ -1,4 +1,4 @@
-// v1.22: the Monomachine parameter map (XY6_LFO/mnm_params.h) and the kit
+// v1.22: the Monomachine parameter map (in the sketch since v1.24) and the kit
 // model built on it - SYNT names per machine, values as the machine shows
 // them, init-kit centres and ranges, 'mach', 'kit' and 'kit watch', and old
 // presets (machine numbers, wave order, MULT) translated on load.

@@ -8,10 +8,9 @@ Teensy 4.0 firmware for the XY6, a controller for the Elektron Monomachine:
 - TurboMIDI at 8x over the standard DIN cable (type `turbo` on the console, or SET → TURBO → ENGAGE)
 - a 256×64 OLED UI, and presets on a 24LC512 EEPROM
 
-The code is one sketch, [`XY6_LFO/XY6_LFO.ino`](XY6_LFO/XY6_LFO.ino), plus
-[`XY6_LFO/mnm_params.h`](XY6_LFO/mnm_params.h): every Monomachine machine, page
-and parameter with its range, default and value list, from a survey of a real
-machine. Keep the two files in the same folder. The sketch's header has the
+Everything is in one sketch, [`XY6_LFO/XY6_LFO.ino`](XY6_LFO/XY6_LFO.ino) - including the
+Monomachine parameter map (every machine, page and parameter with its range,
+default and value list, from a survey of a real machine). Its header has the
 wiring, the controls, and a "WHAT CHANGED" entry for every version.
 
 ## Build and flash
@@ -37,6 +36,10 @@ This builds the sketch on a PC with g++ against a small model of the Teensy API
 | `regression_test` | one check for each bug fixed in v1.18, and that a saved preset loads (v1.23) |
 | `kit_test` | the parameter map (every list complete, every default in range, the FM+DYN ratios) and the kit model on it: init-kit values, learning from the machine's CCs but not from our own echo, names and values per machine, LFO centres and list ranges, PERF, the stick and pattern locks, `mach` / `kit` / `kit watch`, and presets from v1.21 (machines, wave order, MULT) - built twice, for both answers to the map's open question |
 | `turbo_test <scenario>` | TurboMIDI against a model of the Elektron machine, both ways round: the XY6 leading (byte for byte, keepalive, no caps, no ACK, bad echo, a machine slow to switch, machine power-cycled, `turbo off`, silent machine, a MIDI IN too slow for 10x) and the machine leading as a real one does (plain, during back-to-back display pushes, refused after `turbo off`), a MIDI IN that smears edges above 1x (the real test board's symptom), `turbo max`, and the `turbo loop` self-test |
+
+`render_pages` draws every page of the UI into one PNG (`pages.png`, 3x), so a
+layout can be checked pixel for pixel without flashing: `run.sh` leaves it in
+`$TMPDIR/xy6-host-tests/`, or run `render_pages out.png 4` yourself.
 
 CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs these and a
 real Teensy 4.0 compile on every push.
